@@ -1,0 +1,11 @@
+# Mined transcripts, wire captures, and derived datasets — contain real secrets.
+# Raw data never leaves this machine; scrub-at-export for anything that does (plan D5).
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

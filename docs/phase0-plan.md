@@ -235,11 +235,11 @@ adrl/
 9. **Fingerprint drift between corpus era (2.1.150–2.1.199) and live CLI (2.1.201+)**: constants mined from old transcripts may not match live wire traffic. Mitigation: B6 sources discriminator constants from live captures, not the corpus; B10 canary locks them.
 10. **Transcripts under-count requests**: sidecar calls and `usage.iterations` mean corpus-derived request volume is a lower bound. Mitigation: all volume claims in reports labeled "transcript-visible"; wire-true volume comes from B only.
 
-## Decisions the user must make (before day 2)
+## Decisions — RESOLVED 2026-07-06
 
-- **D1 — Baseline model + price table**: which model is the "best single model" for the A7 baseline (claude-opus-4-8 vs claude-fable-5?), and which price-table version/source to pin in the report.
-- **D2 — Simulator token budget**: hard cap on tokens/$ the headless-Claude simulator may burn (C2–C5 run against real Anthropic billing except the Ollama-served S5 runs); suggested framing: a per-scenario cap and a total cap.
-- **D3 — Live-capture commitment**: how many working days of real Claude Code usage route through the proxy (B3), and whether all projects or only selected ones.
-- **D4 — S11 disposition**: confirm dropping/deferring the Codex-dialect fingerprint if the absence check comes back zero (no Codex usage on this machine).
-- **D5 — Capture scrubbing policy**: store raw wire bodies (max fidelity, secrets on local disk) vs scrub-at-write (safer, risks destroying fingerprint evidence). Recommendation: raw on encrypted local disk, gitignored, scrub only what leaves `data/`.
-- **D6 — Local model for dialect tests**: confirm qwen2.5:7b-instruct-q4_K_M as the S5/tool-ID local target (only comfortable fit in 16 GiB), or pull a different small model within the ~99 GiB disk headroom.
+- **D1 — Baseline model**: `claude-opus-4-8` (the frontier rung in the registry — savings numbers read as "vs doing nothing"). Pin the Anthropic price table current at report time in `reports/baseline.md`.
+- **D2 — Simulator token budget**: **$25 total** hard cap across all C2–C5 runs; per-run spend logged against it.
+- **D3 — Live-capture commitment**: **all projects, ~2 weeks** of real usage through the proxy; kill switch = unset `ANTHROPIC_BASE_URL`.
+- **D4 — S11 disposition**: default confirmed — if the absence check returns zero Codex traces, mark S11 falsified and defer the Codex-dialect fingerprint (revisit at C1 gap review).
+- **D5 — Capture scrubbing policy**: **raw, local only** — max fidelity on gitignored local disk; scrub-at-export for anything leaving `data/` (fixtures, reports).
+- **D6 — Local model for dialect tests**: default confirmed — `qwen2.5:7b-instruct-q4_K_M` (only comfortable fit in 16 GiB RAM).
