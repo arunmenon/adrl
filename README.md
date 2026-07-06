@@ -70,3 +70,21 @@ Notes for operators:
 - [Overview deck](decks/adrl-project-overview.pptx) (16 slides) — tells the project story with measured Phase 0 evidence. For leadership and engineers new to the project; meeting-ready.
 
 Draft v2 incorporates an internal consistency review and deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature; see the design doc's changelog (§16).
+
+## The scenario simulator (workstream C)
+
+Generates realistic agent traffic through the capture proxy: builds a throwaway
+project with genuinely planted bugs (failing test, disabled rate limiter, badly
+named variable), picks a scenario with a **randomized prompt phrasing**, and runs
+a headless session inside it — across model families:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m simulator.run_session --runs 4          # random scenarios, model rotation default/opus/sonnet/haiku
+PYTHONPATH=src .venv/bin/python -m simulator.run_session --scenario fix_test --model haiku
+```
+
+Scenarios: `explain` `rename` `fix_test` `investigate` `commit_msg` `feature` `refactor`
+(mapped to design scenarios S1-S10). Sessions run with **scoped tool permissions**
+(read/edit/pytest/git only — no sandbox drop). Hard budget cap: $25 total (decision D2),
+enforced from `data/sim-ledger.jsonl`; every run logs its `session_id` there, which is
+the provenance key separating synthetic from organic captures.
