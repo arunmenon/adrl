@@ -72,8 +72,11 @@ def extract(corpus: Path, out: Path, force_csv: bool = False) -> dict[str, Any]:
                     continue
                 seen_uuids.add(u)
             records.append(rec)
+        rel = str(source.path.relative_to(corpus))
         for turn in assemble_turns(source, records):
-            rows.append(turn_row(turn))
+            row = turn_row(turn)
+            row["source_path"] = rel
+            rows.append(row)
 
     elapsed = time.time() - t0
     summary = {
