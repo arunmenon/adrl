@@ -88,3 +88,19 @@ Scenarios: `explain` `rename` `fix_test` `investigate` `commit_msg` `feature` `r
 (read/edit/pytest/git only — no sandbox drop). Hard budget cap: $25 total (decision D2),
 enforced from `data/sim-ledger.jsonl`; every run logs its `session_id` there, which is
 the provenance key separating synthetic from organic captures.
+
+### Episode mode (LLM-driven multi-turn scenarios)
+
+Single shots can't exercise episode-level design behavior (S15a boundaries, S6 retry
+signals, hysteresis). Episode mode fixes that: step 1 is a labeled scenario, later steps
+are phrased by a **driver LLM playing the user** (direct API, never through the proxy)
+and resume the same session. The episode *skeleton* (scenario, intents, expected labels,
+required markers) stays mechanical — ground truth is never delegated to the driver.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m simulator.run_session --episode random --runs 3
+PYTHONPATH=src .venv/bin/python -m simulator.run_session --episode episode_boundary --model haiku
+```
+
+Episodes: `episode_boundary` (S15a) `rephrase_retry` (S6) `same_for_other` (working-summary)
+`easy_then_hard` (hysteresis) `investigate_then_fix` (S4->S3) `work_then_commit` (3 turns).
