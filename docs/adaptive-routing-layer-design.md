@@ -1,6 +1,6 @@
 # Adaptive Routing Layer — Design Doc
 
-**Status:** Draft v2.1 (amended after internal consistency review + deep-research vetting; see §16 changelog) · **Author:** Arun (with Claude) · **Date:** 2026-07-02
+**Status:** Draft v2 (amended after internal consistency review + deep-research vetting; see §16 changelog) · **Author:** Arun (with Claude) · **Date:** 2026-07-02
 **Context:** Existing stack = Claude Code / Codex CLI → capture proxy → LiteLLM → llama.cpp / MLX endpoints + cloud APIs.
 
 ---
@@ -211,7 +211,7 @@ Second subtlety: **a rung is a model class, not a machine.** OpenRouter's produc
 **What escalation actually does (the "handover of the chart"):**
 
 1. Stop at an **action boundary** — never mid-tool-call.
-2. Rebuild the turn's transcript for the higher rung: strip thinking blocks, normalize tool-call IDs, translate edit-dialect artifacts. (LiteLLM translates the *envelope*; this semantic scrubbing is ours.) **This is a standing transform, not a one-shot rebuild**: the harness's own client-side transcript still holds the local-era artifacts and replays them in *every* subsequent request, so the ID map lives in session state (`tool_id_map`, §5.6) and the scrubber re-runs on every post-escalation request until the episode ends. Escalated sessions therefore pay a small translation tax on the sticky hot path — budget for it.
+2. Rebuild the turn's transcript for the higher rung: strip thinking blocks, translate edit-dialect artifacts. (LiteLLM translates the *envelope*; this semantic scrubbing is ours.) **Tool-call IDs do NOT need re-minting — B5 verified (2026-07-07):** the Anthropic API accepts foreign-format and arbitrary tool IDs as long as `tool_use.id == tool_result.tool_use_id` within the request; only a *mismatch* is rejected (400). Since the harness's own transcript already preserves that internal pairing, the `tool_id_map` machinery the v2 draft carried is **dropped** — the escalation replay just passes IDs through untouched. The real cross-provider blockers remain thinking-block signatures (Anthropic) and encrypted reasoning items (OpenAI); those are stripped, not re-mapped. This removes the standing per-request ID-translation tax v2 worried about.
 3. Prepend a compact failure note: *"A previous attempt tried X; the edit failed to apply twice."* Trade-off: costs ~100 tokens, saves the frontier model from repeating the dead end. Keep it to 3 lines.
 4. Mark the session `escalated_this_episode` → hysteresis keeps subsequent turns on the higher rung until a clear new-task boundary (new episode).
 5. Charge the switch honestly: escalation cold-starts the higher rung's prompt cache (GitHub Copilot re-routes only at cache boundaries for exactly this reason). The escalate-or-persist decision should carry an explicit cache-loss term; flywheel data (§5.7) tells you when one more local attempt is cheaper than the rebuild.
@@ -539,6 +539,7 @@ Two weeks of Phase 0/1 also answers the "is this worth it?" question with your o
 - **Sidecar fingerprint corrected**: utility calls observed on Opus/Sonnet with `max_tokens=64`, not Haiku-class — fingerprint by shape (no tools, tiny output budget, ≤2 messages), not model name (§4, §5.1).
 - **Registry price fixed**: frontier is $5/MTok in, $25 out (drafts said 15.0) (§5.4).
 - **Phase 1 re-prioritized**: subagent-local pilot promoted alongside utility pinning — Phase 0 measured easy user turns at 3.7% of spend vs subagent traffic at 75% of turns; S13 is the dollar lever (§10).
+- **Tool-ID re-minting dropped (B5)**: live experiment confirmed IDs need only be internally consistent, not provider-minted — the `tool_id_map` machinery is removed from the escalation rebuild (§5.5); thinking-block signatures / encrypted reasoning remain the real cross-provider blockers.
 
 **v2 (2026-07-02)** — amendments from an internal consistency review plus deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature (ETH cascade routing, LLMRouterBench, Router-R1, xRouter):
 
