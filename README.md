@@ -41,6 +41,9 @@ Draft v2 incorporates an internal consistency review and deep-research vetting a
 - [Corpus metrics](reports/corpus-metrics.md) — traffic shares vs design §4, trip-wire frequencies, per-intent medians, token economics, and the opus-4-8 best-single-model baseline
 - [Scenario validation](reports/scenario-validation.md) — S1-S15 match counts and verdicts against the ≥3-traces bar, incl. the investigated S15b finding
 - [Session-keying assumption (B4)](reports/assumption-user-id.md) — answered: `metadata.user_id` carries a per-session `session_id`
+- [Tool-ID assumption (B5)](reports/assumption-tool-ids.md) — answered: IDs need internal consistency, not re-minting
+- [Local-rung scenarios (S5/S7)](reports/scenario-local-rung.md) — S5 falsified for this model (~1.0 reliability), S7 fallback confirmed
+- **[Phase 0 exit report](reports/phase0-exit.md)** — every §10 criterion pass/fail, the business case, and the Phase-1 handoff
 
 ## Setup
 
