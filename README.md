@@ -135,3 +135,14 @@ PYTHONPATH=src .venv/bin/python -m simulator.run_session --episode episode_bound
 
 Episodes: `episode_boundary` (S15a) `rephrase_retry` (S6) `same_for_other` (working-summary)
 `easy_then_hard` (hysteresis) `investigate_then_fix` (S4->S3) `work_then_commit` (3 turns).
+
+## The shadow router (workstream B7 — in progress)
+
+`src/router/` — the routing layer's decision components, built test-first against
+captured traffic. So far: the **call-type discriminator** (design §5.1), with
+fingerprints copied from live wire evidence rather than guessed. Evaluate it
+against all captures at any time:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m router.eval_captures   # -> reports/discriminator-eval.md
+```
