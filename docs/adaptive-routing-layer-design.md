@@ -1,6 +1,6 @@
 # Adaptive Routing Layer — Design Doc
 
-**Status:** Draft v2 (amended after internal consistency review + deep-research vetting; see §16 changelog) · **Author:** Arun (with Claude) · **Date:** 2026-07-02
+**Status:** Draft v2.1 (amended after internal consistency review + deep-research vetting; see §16 changelog) · **Author:** Arun (with Claude) · **Date:** 2026-07-02
 **Context:** Existing stack = Claude Code / Codex CLI → capture proxy → LiteLLM → llama.cpp / MLX endpoints + cloud APIs.
 
 ---
@@ -71,8 +71,9 @@ Before designing the router, be clear about what it will see. In a typical codin
 
 | Request kind | Rough share | What it is | Router action |
 |---|---|---|---|
-| **Tool continuation** | 70–90% | The harness returning a tool result mid-turn | **Inherit** the turn's route. No thinking. |
-| **Housekeeping / utility call** | 5–15% | Harness sidecar work: session titles, compaction summaries (Claude Code fires Haiku-class calls for these) | **Hard-pin to local.** Always. Zero risk, instant savings. |
+| **Token-count bookkeeping** | dominant by raw count (~72% observed on the wire) | `/v1/messages/count_tokens` — context accounting, not a completion | **Pass through untouched.** Identifiable by path alone. |
+| **Tool continuation** | 70–90% of completions | The harness returning a tool result mid-turn | **Inherit** the turn's route. No thinking. |
+| **Housekeeping / utility call** | 5–15% | Harness sidecar work: titles, topic detection, auto-mode classifiers, compaction. **Wire-verified 2026-07:** sidecars observed on Opus/Sonnet with `max_tokens<=8192`, `tools` absent, `<=2` messages — fingerprint by SHAPE, not model name (the Haiku-class assumption was wrong) | **Hard-pin to local.** Always. Zero risk, instant savings. |
 | **New user turn** | 5–15% | The human actually typed something | **Full routing decision.** |
 | **Subagent spawn** | occasional | Harness starts a bounded helper ("find where X is defined") | Route independently; usually local (small scope, fresh context). |
 
@@ -92,7 +93,8 @@ Two consequences that shape everything downstream:
 How each label is detected:
 
 - `continuation` — last message contains a `tool_result` / `tool` role block and the session already has an active turn.
-- `utility` — request matches known harness housekeeping fingerprints: the model name the harness asked for (Claude Code requests a Haiku-class name for sidecar work), tiny max_tokens, characteristic system prompts ("summarize this conversation in..."). Two subtypes with different routing: `utility:light` (titles, topic detection — always pinned to local-small) and `utility:compaction` (transcript summarization — quality-critical, routed by the episode's current rung; see scenarios doc S14).
+- `passthrough` — not a completion at all: `/v1/messages/count_tokens` (the raw-count majority of wire traffic), `max_tokens<=2` cache-prewarm pings, non-API paths. Identified by path/shape alone; never routed. (Added after live wire capture — the v1 draft missed this kind entirely.)
+- `utility` — request matches harness housekeeping fingerprints. **Wire-verified (cc 2.1.201-202):** fingerprint by *shape* — `tools` absent, `max_tokens<=8192`, `<=2` messages — not by model name; observed sidecars run on Opus/Sonnet with `max_tokens=64`, contradicting the draft's Haiku-class assumption. Characteristic system prompts ("summarize this conversation in...") remain a secondary tell. Two subtypes with different routing: `utility:light` (titles, topic detection — always pinned to local-small) and `utility:compaction` (transcript summarization — quality-critical, routed by the episode's current rung; see scenarios doc S14).
 - `subagent` — fresh system prompt mid-session, or harness-specific markers (Claude Code subagent calls carry distinct metadata).
 - `user_turn` — everything else where the newest message is genuine human text.
 
@@ -183,7 +185,8 @@ rungs:
     model_class: claude-opus-latest
     endpoints: [anthropic-api]
     max_context: 200000
-    cost_per_mtok: 15.0
+    cost_per_mtok_in: 5.0      # verified 2026-07 (opus-4-8: $5 in / $25 out; cache read 0.1x, write 1.25x)
+    cost_per_mtok_out: 25.0    # earlier drafts said 15.0 — wrong
     tool_call_reliability: {claude_code: 0.995}   # never 1.00 — calibration math divides by failure odds
 ```
 
@@ -246,7 +249,7 @@ The router has to *remember* between requests. Minimum viable memory per session
 | `working_summary` | 2-line rolling intent summary | resolving "do the same for the other module" |
 | `tool_id_map` | `{toolu_L2: toolu_F2, …}` | post-escalation scrubber — applied to **every** request after an escalation, not once (§5.5) |
 
-**Session identity:** use the harness's own session metadata where present (Claude Code sends session/user identifiers); fall back to `hash(system_prompt + first_user_message)`. Expire after ~4h idle.
+**Session identity — RESOLVED (B4, wire-verified 2026-07-06):** Claude Code's `metadata.user_id` is a JSON object `{device_id, account_uuid, session_id}` with `session_id` unique per session — parse it and key on `session_id`. The `hash(system_prompt + first_user_message)` fallback is needed only for harnesses that send no session identity. Expire after ~4h idle.
 
 ### 5.7 The flywheel — how the router gets smarter
 
@@ -450,7 +453,7 @@ LiteLLM already ships much of the operational machinery; rebuilding it means two
 | Phase | What ships | Risk | Exit criteria |
 |---|---|---|---|
 | **0 — Shadow** (week 1) | Discriminator + features + policy run on live traffic, *log decisions only*; replay historical captures offline | Zero | Predicted local share & escalation rate look sane on ≥200 real turns; router overhead p50 < 20ms; **best-single-model baseline** computed on replayed traffic (the number Phase 3 must beat); two assumptions tested against real captures — is `metadata.user_id` per-session or per-user, and do tool-call IDs need re-minting cross-provider or only internal consistency? |
-| **1 — Pin utility calls** | Housekeeping calls → local, hardcoded | ~Zero (worst case: uglier session titles) | No harness breakage after 1 week |
+| **1 — Pin utility calls + subagent-local pilot** | Housekeeping sidecars → local-small, hardcoded; **bounded read-only subagents → local-code** (re-prioritized: Phase 0 measured easy user turns at 45.5% of turns but only 3.7% of spend, while subagent traffic is 75% of turns and the bulk of token volume — S13 is the dollar lever) | ~Zero for utility (uglier titles); Low for subagents (bounded scope, trip-wires armed) | No harness breakage after 1 week; subagent failure rate ≤ frontier baseline |
 | **2 — Gates + heuristics live** | User turns routed; trip-wires armed; kill switch to static config | Moderate | Escalation rate < 30%; user-retry rate on local-handled turns ≤ frontier baseline; zero privacy-pin violations |
 | **3 — Learned router** | Layer-2 model trained on Phase 0–2 outcome logs, decides the ambiguous middle | Contained (middle band only) | Beats heuristic-only AND the Phase-0 best-single-model baseline on replay, then live A/B for $/turn at equal retry rate |
 
@@ -528,6 +531,14 @@ Two weeks of Phase 0/1 also answers the "is this worth it?" question with your o
 ---
 
 ## 16. Changelog
+
+**v2.1 (2026-07-07)** — corrections from LIVE WIRE EVIDENCE (Phase 0 capture proxy, cc 2.1.201-202) and Phase 0 economics:
+
+- **Session identity resolved (B4)**: `metadata.user_id` carries a per-session `session_id` — parse and key on it; hash fallback demoted to non-Claude-Code harnesses (§5.6).
+- **New request kind `passthrough`**: `/v1/messages/count_tokens` is ~72% of raw wire traffic and was missing from the v1/v2 taxonomy entirely; plus prewarm pings and non-API paths (§4, §5.1).
+- **Sidecar fingerprint corrected**: utility calls observed on Opus/Sonnet with `max_tokens=64`, not Haiku-class — fingerprint by shape (no tools, tiny output budget, ≤2 messages), not model name (§4, §5.1).
+- **Registry price fixed**: frontier is $5/MTok in, $25 out (drafts said 15.0) (§5.4).
+- **Phase 1 re-prioritized**: subagent-local pilot promoted alongside utility pinning — Phase 0 measured easy user turns at 3.7% of spend vs subagent traffic at 75% of turns; S13 is the dollar lever (§10).
 
 **v2 (2026-07-02)** — amendments from an internal consistency review plus deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature (ETH cascade routing, LLMRouterBench, Router-R1, xRouter):
 

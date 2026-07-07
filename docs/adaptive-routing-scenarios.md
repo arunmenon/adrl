@@ -81,7 +81,7 @@ Validation note (Phase 0 acceptance): for each scenario, find ≥3 real traces i
 
 ### WIRE — what actually arrives (3 requests, not 1)
 
-**Request 1 & 2 — background calls the user never sees.** Claude Code fires Haiku-class sidecar requests for housekeeping (terminal title, topic detection). It asks for whatever model ID `ANTHROPIC_DEFAULT_HAIKU_MODEL` resolves to (the old `ANTHROPIC_SMALL_FAST_MODEL` name is deprecated). If your proxy doesn't claim that ID, these 400 and Claude Code gets flaky:
+**Request 1 & 2 — background calls the user never sees.** Claude Code fires small sidecar requests for housekeeping (terminal title, topic detection, auto-mode classifiers). **Wire-verified 2026-07 (cc 2.1.201-202): these were observed running on Opus/Sonnet with `max_tokens=64` and no tools — not Haiku-class as this draft assumed.** Fingerprint by shape (tools absent, `max_tokens<=8192`, `<=2` messages), never by model name. If your proxy doesn't claim whatever model ID they request, these 400 and Claude Code gets flaky:
 
 ```jsonc
 POST /v1/messages
