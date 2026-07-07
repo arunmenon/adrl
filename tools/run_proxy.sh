@@ -36,9 +36,20 @@ if [ -f data/proxy.pid ] && kill -0 "$(cat data/proxy.pid)" 2>/dev/null; then
 fi
 
 mkdir -p data
-# Capture-only by default — NO --route-utility. Live utility pinning (P1-A) is
-# opt-in and must be enabled deliberately; the default here never rewrites traffic.
-PYTHONPATH=src nohup .venv/bin/python -m proxy.capture_proxy --port "${PORT}" \
+# Capture-only by default. Live utility pinning (P1-A) is opt-in via
+# ROUTE_UTILITY=1 and requires the local execution stack (ollama + LiteLLM :4001)
+# — the proxy fails open to Anthropic if that stack is unreachable, but we refuse
+# to *start* in routing mode without it so the flip is deliberate, not silent.
+ROUTE_ARGS=""
+if [ "${ROUTE_UTILITY:-}" = "1" ]; then
+  if ! curl -s -o /dev/null -m 4 "http://localhost:4001/health/liveliness" 2>/dev/null; then
+    echo "ROUTE_UTILITY=1 but LiteLLM :4001 not answering — start tools/run_litellm.sh first" >&2
+    exit 1
+  fi
+  ROUTE_ARGS="--route-utility"
+  echo "LIVE utility routing ENABLED (utility housekeeping -> local rung, fail-open to Anthropic)"
+fi
+PYTHONPATH=src nohup .venv/bin/python -m proxy.capture_proxy --port "${PORT}" ${ROUTE_ARGS} \
   > data/proxy.log 2>&1 &
 echo $! > data/proxy.pid
 sleep 1
