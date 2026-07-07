@@ -29,10 +29,20 @@ Phase 0 asked one question — *is this worth building, and are the design's ass
 Measured on 5.5 weeks of real traffic (3,127 transcripts, 5,027 turns):
 
 - **Spend in window:** ~$3,313 observed; **$2,941** re-priced at the opus-4-8 best-single-model baseline. This is the number a learned router must beat.
-- **Cache-hit ratio: 99.3%** of prompt tokens — empirical vindication of the never-switch-mid-turn stance; that cache is the asset a naive router would destroy.
-- **The headline, and a course-correction:** easy user turns are **45.5% of turns but only 3.7% of spend ($108)**. Routing them local is nearly free money but small money. The dollars are in **subagent traffic — 75% of turns, the bulk of token volume.** Phase 1 was re-prioritized accordingly (design §10): the subagent-local pilot (S13) is promoted alongside utility-call pinning.
+- **Cache-hit ratio: 99.3%** of prompt tokens — empirical vindication of the never-switch-mid-turn stance; that cache is the asset a naive router would destroy. (This finding is traffic-mix-independent — it holds regardless of who generated the traffic.)
+- **The directional finding (magnitude NOT representative):** easy user turns are 45.5% of turns but only 3.7% of spend; subagent traffic is 75% of turns. **Read this as direction, not magnitude.** 92% of that subagent volume was workflow-spawned, and this 5.5-week window was dominated by multi-agent workflow runs — *including the deep-research and planning workflows run to build this very project*. The corpus is single-user, on a Max plan where subagent work is free at the margin, so subagents are over-represented relative to a metered enterprise user. The **true sample for the local-edit reliability claim is 5 Edit operations on ~388-byte toy sandbox files** — it establishes almost nothing about real 500-line files.
 
-**Verdict: worth building** — but the value thesis shifted from "route easy user turns cheap" to "delegate the agent's bounded subagent work to a local model," which is exactly the hybrid pattern the design already described and the industry's SLM-for-agents thesis.
+### The representativeness reframe (the honest, and stronger, story)
+
+The subagent-heavy shape is not noise — it is a **preview of latent demand**. On a Max plan, subagent/workflow use is unconstrained; a metered enterprise developer (e.g. PayPal, token-limited) rations it and runs mostly main-session work. The routing layer's local rung removes exactly that constraint (local = $0). So this window models **what a constrained developer would do *once the local rung exists*, not what they do today.**
+
+That yields two value stories, and the second is the stronger enterprise sell:
+1. **Cost reduction** on traffic that already flows (sized by the $2,941 baseline, for *this* user).
+2. **Capability unlock** — let developers use multi-agent workflows that token budgets currently suppress. "Your engineers can run 10-agent research workflows without it counting against quota" is a productivity argument, not a savings-percentage one.
+
+**What would make the economics representative** (deferred to Phase 1/pilot): a *constrained baseline* — a developer working under normal token limits without the local rung (the "before") set against this window (closer to the "after"); and real-codebase edit-reliability numbers on the production model (office M4 Max / 35B), not toy sandboxes on a 7B.
+
+**Verdict: worth building** — the machinery is proven; the *value thesis* (subagent delegation + capability unlock) is directionally strong but must be *sized* on target-population traffic, not this single-user, workflow-heavy, Max-plan window.
 
 ---
 
@@ -44,7 +54,7 @@ Phase 0 was cheap-falsification: five design assumptions met reality, and **ever
 2. **Tool-ID re-minting (B5)** — not needed; the persistent `tool_id_map` and per-request translation tax are removed from the escalation rebuild.
 3. **New `passthrough` request kind** — `count_tokens` is ~72% of raw wire traffic and was missing from the taxonomy entirely; now handled by path alone.
 4. **Sidecar fingerprint** — utility calls run on Opus/Sonnet with tiny budgets, not Haiku-class; fingerprint by shape, not model name.
-5. **Local-rung reliability (S5)** — `qwen2.5:7b-instruct` scores ≈1.0 on Claude Code's edit dialect, not the assumed 0.87. The trip-wire fires less, the cascade math favours more local-first attempts. The (model, harness) registry did its job: measured, didn't assume.
+5. **Local-rung reliability (S5) — PRELIMINARY, not established.** `qwen2.5:7b-instruct` showed 0 edit-dialect failures — but on only **5 real Edit operations, on ~388-byte toy files**. This does NOT falsify the design's 0.87 assumption; it shows the model doesn't trip on easy targets. Real 500-line files with mixed whitespace — where the exact-string dialect actually breaks — remain untested. The production number must come from the office M4 Max / 35B on real repositories. The (model, harness) registry is the right instrument; it just hasn't been pointed at representative work yet.
 
 Two findings also *raised* priorities:
 - **Secret-scanner precision is the highest-leverage knob** — the 7 secret-flagged sessions hold 73% of user turns, making the pin-context collision (§5.8) the dominant case, not an edge one. Tuning the scanner's false-positive rate (§13.4) is now Phase-1 priority-one.

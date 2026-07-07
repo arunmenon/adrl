@@ -33,6 +33,7 @@ data/        gitignored — corpus snapshot, wire captures, datasets, ledgers (r
 - [Scenario walkthroughs](docs/adaptive-routing-scenarios.md) — 15 wire-level traces through the layer (Draft v2)
 - [Deep-research vetting report](docs/deep-research-vetting.md) — verified findings, sources, and open questions behind the v2 amendments
 - [Phase 0 plan](docs/phase0-plan.md) — three workstreams with acceptance criteria; reports land in `reports/`
+- [Phase 1 plan](docs/phase1-plan.md) — utility pinning, secret-scanner tuning, the post-call path, subagent pilot, representativeness
 
 Draft v2 incorporates an internal consistency review and deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature; see the design doc's changelog (§16).
 
