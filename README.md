@@ -163,3 +163,19 @@ production execution stack, not just a Phase-0 experiment.
 local -> cheap-cloud -> frontier (the S7 path). Verified end-to-end: an
 Anthropic-format request routes to `qwen2.5:7b-instruct-q4_K_M` on this M1 Pro
 (~29 tok/s decode) and returns a valid Anthropic response, tool calls included.
+
+### S5/S7 scenario capture on the local rung
+
+```bash
+./tools/run_ollama.sh && ./tools/run_litellm.sh
+PYTHONPATH=src nohup .venv/bin/python -m proxy.capture_proxy --port 4002 \
+  --upstream http://localhost:4001 --captures data/captures-local > data/proxy-local.log 2>&1 &
+# S5 — dialect failures: edit scenarios on the local model
+PYTHONPATH=src .venv/bin/python -m simulator.run_session --scenario fix_test --model local-code --proxy http://localhost:4002
+# S7 — infra fallback: dead local endpoint -> cloud (config/litellm-fallback-test.yaml)
+PYTHONPATH=src .venv/bin/python -m simulator.induce_fallback
+```
+
+Findings in `reports/scenario-local-rung.md`: this 7B does NOT reproduce S5 (measured
+reliability ≈1.0 vs the design's 0.87 assumption — the registry measuring, not guessing);
+S7 fallback confirmed.

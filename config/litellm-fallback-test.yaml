@@ -1,0 +1,23 @@
+# S7 deterministic infra-fallback test: local rung points at a DEAD port so the
+# connection error is guaranteed (ollama auto-restarts, defeating a kill-based
+# test). Confirms LiteLLM's fallback local-code -> cheap-cloud fires — the infra
+# ladder (design §8.3), distinct from the router's semantic escalation.
+model_list:
+  - model_name: local-code
+    litellm_params:
+      model: openai/qwen2.5:7b-instruct-q4_K_M
+      api_base: http://localhost:11499/v1   # nothing listening here
+      api_key: "ollama"
+  - model_name: cheap-cloud
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  fallbacks:
+    - local-code: ["cheap-cloud"]
+  num_retries: 0            # fail fast to the fallback, don't retry the dead port
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 60

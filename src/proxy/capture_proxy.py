@@ -27,7 +27,9 @@ from pathlib import Path
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
-UPSTREAM = "https://api.anthropic.com"
+import os
+
+UPSTREAM = os.environ.get("CAPTURE_UPSTREAM", "https://api.anthropic.com")
 REDACT_HEADERS = {"authorization", "x-api-key", "cookie", "set-cookie"}
 # Hop-by-hop headers must not be forwarded either direction.
 HOP_BY_HOP = {
@@ -137,10 +139,14 @@ async def make_app(capture_root: Path) -> web.Application:
 
 
 def main() -> None:
+    global UPSTREAM
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=4000)
     ap.add_argument("--captures", type=Path, default=Path("data/captures"))
+    ap.add_argument("--upstream", default=UPSTREAM,
+                    help="where to relay (default Anthropic; set to the LiteLLM proxy for local-rung capture)")
     args = ap.parse_args()
+    UPSTREAM = args.upstream
     args.captures.mkdir(parents=True, exist_ok=True)
     print(f"capture proxy :{args.port} -> {UPSTREAM}  (captures -> {args.captures}/)")
     print(f"use:  ANTHROPIC_BASE_URL=http://localhost:{args.port} claude")
