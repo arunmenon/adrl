@@ -2,12 +2,45 @@
 
 A routing layer for LLM coding agents that sits between coding harnesses (Claude Code / Codex CLI) and LiteLLM, deciding per user turn whether work goes to a local model (llama.cpp / MLX), cheap cloud, or a frontier model — with sticky per-turn routing to protect prompt caches, deterministic escalation trip-wires, a one-way privacy pin, and a flywheel of logged outcomes for tuning.
 
+## Status (2026-07-07)
+
+**Phase 0 (shadow / evidence-gathering) in progress.** Design docs at v2 after two review
+passes. Workstream A (transcript mining) complete; B2 capture proxy live and accumulating
+organic traffic toward the ≥200-turn shadow-run gate; simulator (C2) operational with
+episode mode. Assumption test B4 answered (session keying: solved). Next: B5 tool-ID
+experiment, B6 wire fingerprints, B7 shadow router. Headline findings so far: traffic
+model validated (73.3% continuations vs 70-90% predicted); 99.3% cache-hit ratio;
+easy user turns are 45.5% of turns but only 3.7% of spend — the dollar lever is
+subagent traffic. See `reports/` for the evidence.
+
+## Repo map
+
+```
+docs/        design doc, 15 scenarios, vetting report, Phase 0 plan, deck prompt
+src/
+  miner/     workstream A — transcript corpus -> turns.parquet + reports
+  proxy/     workstream B — wire-capture proxy (ANTHROPIC_BASE_URL target)
+  simulator/ workstream C — scenario & episode traffic generator
+tools/       snapshot_corpus.sh, run_proxy.sh
+reports/     committed evidence (aggregates only, no payloads)
+decks/       presentation decks
+data/        gitignored — corpus snapshot, wire captures, datasets, ledgers (real secrets live here)
+```
+
 ## Documents
 
 - [Design doc](docs/adaptive-routing-layer-design.md) — architecture, components, rollout plan (Draft v2)
 - [Scenario walkthroughs](docs/adaptive-routing-scenarios.md) — 15 wire-level traces through the layer (Draft v2)
 - [Deep-research vetting report](docs/deep-research-vetting.md) — verified findings, sources, and open questions behind the v2 amendments
 - [Phase 0 plan](docs/phase0-plan.md) — three workstreams with acceptance criteria; reports land in `reports/`
+
+Draft v2 incorporates an internal consistency review and deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature; see the design doc's changelog (§16).
+
+## Reports (evidence produced so far)
+
+- [Corpus metrics](reports/corpus-metrics.md) — traffic shares vs design §4, trip-wire frequencies, per-intent medians, token economics, and the opus-4-8 best-single-model baseline
+- [Scenario validation](reports/scenario-validation.md) — S1-S15 match counts and verdicts against the ≥3-traces bar, incl. the investigated S15b finding
+- [Session-keying assumption (B4)](reports/assumption-user-id.md) — answered: `metadata.user_id` carries a per-session `session_id`
 
 ## Setup
 
@@ -68,8 +101,6 @@ Notes for operators:
 
 - [Handover deck](decks/adaptive-routing-layer-handover.pptx) (47 slides) — teaches the design itself: every component, all 15 scenarios as wire-level traces. For the team implementing/operating it; self-study density.
 - [Overview deck](decks/adrl-project-overview.pptx) (16 slides) — tells the project story with measured Phase 0 evidence. For leadership and engineers new to the project; meeting-ready.
-
-Draft v2 incorporates an internal consistency review and deep-research vetting against production routers (GitHub Copilot Auto, OpenRouter, LiteLLM) and the routing literature; see the design doc's changelog (§16).
 
 ## The scenario simulator (workstream C)
 
