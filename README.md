@@ -146,3 +146,20 @@ against all captures at any time:
 ```bash
 PYTHONPATH=src .venv/bin/python -m router.eval_captures   # -> reports/discriminator-eval.md
 ```
+
+## The execution layer — LiteLLM + local rung (workstream C3/C4)
+
+The local model rung, served by ollama and exposed to the harness in Anthropic
+`/v1/messages` format via LiteLLM (design §8.3). This is the first piece of the
+production execution stack, not just a Phase-0 experiment.
+
+```bash
+./tools/run_ollama.sh     # ollama on :11434 (serves the local model)
+./tools/run_litellm.sh    # LiteLLM on :4001 (reads data/anthropic-key for cloud rungs)
+```
+
+`config/litellm-local.yaml` maps rungs: `local-code`/`local-small` -> ollama,
+`cheap-cloud`/`frontier` -> Anthropic passthrough, with infra fallback
+local -> cheap-cloud -> frontier (the S7 path). Verified end-to-end: an
+Anthropic-format request routes to `qwen2.5:7b-instruct-q4_K_M` on this M1 Pro
+(~29 tok/s decode) and returns a valid Anthropic response, tool calls included.

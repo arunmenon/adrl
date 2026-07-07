@@ -1,0 +1,43 @@
+# LiteLLM proxy — the execution layer beneath the router (design §8.3).
+# Local rung = qwen2.5:7b on ollama (this M1 Pro); cloud rungs = Anthropic passthrough.
+# Exposes an Anthropic /v1/messages endpoint so the harness can point at it unchanged.
+#
+# Start:  ./tools/run_litellm.sh   (reads data/anthropic-key)
+# Chain:  simulator/harness -> capture proxy (:4000) -> litellm (:4001) -> ollama | anthropic
+
+model_list:
+  # --- local rung: ollama, OpenAI-compatible endpoint on :11434 ---
+  - model_name: local-code
+    litellm_params:
+      model: openai/qwen2.5:7b-instruct-q4_K_M
+      api_base: http://localhost:11434/v1
+      api_key: "ollama"            # ollama ignores it but the client requires one
+  - model_name: local-small
+    litellm_params:
+      model: openai/llama3.2:latest
+      api_base: http://localhost:11434/v1
+      api_key: "ollama"
+
+  # --- cloud rungs: Anthropic passthrough (key injected from env) ---
+  - model_name: cheap-cloud
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: frontier
+    litellm_params:
+      model: anthropic/claude-opus-4-8
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  # INFRA failures only (timeouts, 5xx, connection refused) — this is the S7 path.
+  # Semantic escalation (bad-but-valid responses) is the router's job, not LiteLLM's.
+  fallbacks:
+    - local-code: ["cheap-cloud"]
+    - local-small: ["cheap-cloud"]
+    - cheap-cloud: ["frontier"]
+  # Feasibility backstop: drop any deployment whose context window < the request.
+  enable_pre_call_checks: true
+
+litellm_settings:
+  drop_params: true          # ollama rejects some Anthropic-only params; strip them
+  request_timeout: 600       # local prefill on a cold model can be slow
