@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, NamedTuple, Optional
 
-from miner.scenarios import canonical_call
+from router.canon import canonical_call
 
 # Marker strings mirrored from miner.turns (kept local so the live hot-path does
 # not import the whole offline turn-builder just for two constants).

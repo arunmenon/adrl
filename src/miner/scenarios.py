@@ -38,15 +38,7 @@ COMPLETION_PHRASE = re.compile(
 TRACE_CAP = 5  # raw traces extracted per scenario
 
 
-def canonical_call(name: str, args: Any) -> str:
-    """Loop detection needs canonicalized args (S4: trailing slash != new call)."""
-    try:
-        normalized = json.dumps(args, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        normalized = str(args)
-    normalized = re.sub(r"/+(?=[\"'])", "", normalized)  # trailing path slashes
-    normalized = re.sub(r"\s+", " ", normalized)
-    return hashlib.sha1(f"{name}:{normalized}".encode()).hexdigest()
+from router.canon import canonical_call  # single source of truth (dependency-light)
 
 
 def detect_loops(corpus: Path) -> list[dict[str, Any]]:
