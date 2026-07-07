@@ -1,0 +1,33 @@
+{
+  "method": "POST",
+  "path": "/v1/messages?beta=true",
+  "body": {
+    "max_tokens": 64,
+    "system": "cc_entrypoint=cli",
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text"
+          },
+          {
+            "type": "text"
+          },
+          {
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "_n_messages": 2,
+    "metadata": {
+      "user_id": "{\"session_id\": \"fixture-session\"}"
+    }
+  },
+  "expected_label": "utility:sidecar"
+}

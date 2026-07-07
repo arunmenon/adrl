@@ -1,0 +1,6 @@
+{
+  "method": "HEAD",
+  "path": "/",
+  "body": null,
+  "expected_label": "passthrough:non_api"
+}

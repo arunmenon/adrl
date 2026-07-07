@@ -1,0 +1,39 @@
+{
+  "method": "POST",
+  "path": "/v1/messages?beta=true",
+  "body": {
+    "max_tokens": 64000,
+    "tools": [
+      {
+        "name": "redacted"
+      },
+      {
+        "name": "redacted"
+      }
+    ],
+    "system": "cc_entrypoint=cli",
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      },
+      {
+        "role": "user",
+        "content": "x"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result"
+          }
+        ]
+      }
+    ],
+    "_n_messages": 239,
+    "metadata": {
+      "user_id": "{\"session_id\": \"fixture-session\"}"
+    }
+  },
+  "expected_label": "continuation"
+}

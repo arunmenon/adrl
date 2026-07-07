@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/v1/messages/count_tokens?beta=true",
+  "body": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      }
+    ],
+    "_n_messages": 1
+  },
+  "expected_label": "passthrough:count_tokens"
+}

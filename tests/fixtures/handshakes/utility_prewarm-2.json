@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "body": {
+    "max_tokens": 1,
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      }
+    ],
+    "_n_messages": 1
+  },
+  "expected_label": "utility:prewarm"
+}

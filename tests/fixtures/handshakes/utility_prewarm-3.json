@@ -1,0 +1,18 @@
+{
+  "method": "POST",
+  "path": "/v1/messages?beta=true",
+  "body": {
+    "max_tokens": 1,
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      }
+    ],
+    "_n_messages": 1,
+    "metadata": {
+      "user_id": "{\"session_id\": \"fixture-session\"}"
+    }
+  },
+  "expected_label": "utility:prewarm"
+}
