@@ -68,7 +68,12 @@ def _cheapest_feasible(rungs: dict[str, dict], context_tokens: int) -> str:
 
 
 def route_turn(f: TurnFeatures, session: SessionState,
-               registry: dict[str, dict] = REGISTRY) -> Route:
+               registry: dict[str, dict] = REGISTRY, classifier=None) -> Route:
+    """`classifier`, when supplied, is a fail-safe callable text -> verdict|None
+    (verdict has .tier and .needs_frontier) used to resolve the ambiguous middle.
+    Injected, not imported, so policy stays pure/fast/testable; None keeps the
+    Phase-3 middle_default. The classifier must itself never raise (it returns
+    None on any failure); we treat None as 'no opinion' and fall back."""
     # ── Layer 0: HARD GATES — never overridden ──────────────────────────────
     if session.privacy_pinned or f.privacy_pinned:
         if f.context_tokens > CONTEXT_HEADROOM * registry["local"]["max_context"]:
@@ -104,6 +109,18 @@ def route_turn(f: TurnFeatures, session: SessionState,
         return Route("frontier", cascade=False, layer="heuristic", score=s,
                      reason=f"hard ({f.verb_class}, {s:.2f} > {T_HARD}) — don't burn a doomed local try")
 
-    # ── Layer 2: LEARNED ROUTER — Phase 3 stub ──────────────────────────────
+    # ── Layer 2: LLM CLASSIFIER — resolve the ambiguous middle (fail-safe) ───
+    # Shadow-validated: resolves 100% of the regex-uncertain middle, frontier
+    # calls carry +8pt higher real hard-rate (reports/classifier-shadow.md).
+    if classifier is not None and f.instruction_text:
+        verdict = classifier(f.instruction_text)   # fail-safe: None on any failure
+        if verdict is not None:
+            if getattr(verdict, "needs_frontier", False):
+                return Route("frontier", cascade=False, layer="classifier", score=s,
+                             reason=f"classifier: {getattr(verdict, 'tier', '?')} -> frontier")
+            return Route("local", cascade=True, layer="classifier", score=s,
+                         reason=f"classifier: {getattr(verdict, 'tier', '?')} -> local w/ trip-wires")
+
+    # Fallback when no classifier is wired, or it abstained (None): Phase-3 stub.
     return Route("local", cascade=True, layer="middle_default", score=s,
-                 reason=f"ambiguous middle ({s:.2f}) — local w/ trip-wires until Phase 3 earns its keep")
+                 reason=f"ambiguous middle ({s:.2f}) — local w/ trip-wires (classifier unavailable)")

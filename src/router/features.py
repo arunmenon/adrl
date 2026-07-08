@@ -40,6 +40,7 @@ class TurnFeatures:
     # intent (from the isolated human sentence only)
     verb_class: str = "unknown"
     verb_score: float = 0.5          # unknown -> middle of the band, on purpose
+    instruction_text: str = ""       # the isolated human sentence (for the LLM middle-resolver)
     broad_scope: bool = False
     narrow_scope: bool = False
     # context
@@ -89,7 +90,7 @@ def extract(instruction_text: str, *, context_tokens: int = 0, turn_index: int =
     verb, score = classify_intent(instruction_text or "")
     text = instruction_text or ""
     return TurnFeatures(
-        verb_class=verb, verb_score=score,
+        verb_class=verb, verb_score=score, instruction_text=text,
         broad_scope=bool(SCOPE_BROAD.search(text)),
         narrow_scope=bool(SCOPE_NARROW.search(text)),
         context_tokens=context_tokens, turn_index=turn_index,
