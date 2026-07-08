@@ -32,6 +32,12 @@ from .tasks import SCENARIOS, pick
 BUDGET_CAP_USD = 25.00  # decision D2 — hard cap, all simulator runs ever
 PER_RUN_TIMEOUT_S = 600
 MAX_TURNS = 25
+# Episodes are now long-tailed (corpus p50 ~24 user-turns, tail to ~221); cap
+# real spawned turns per episode so a single fat-tail draw can't blow the budget.
+MAX_EPISODE_TURNS = 40
+MAX_CLARIFY_TURNS = 6          # clarifying-answer insertions per episode
+INTERRUPT_CUTOFF_S = 8         # short cutoff that forces a real mid-stream interrupt
+INTERRUPT_MARKER = "[Request interrupted by user]"
 # "default" = whatever the CLI is configured to use (Fable-class here); the
 # aliases exercise the other families the registry needs evidence for.
 DEFAULT_MODELS = ["default", "opus", "sonnet", "haiku"]
@@ -59,8 +65,13 @@ ALLOWED_TOOLS = [
 
 
 def spawn_turn(prompt: str, model: str, proxy: str, cwd: Path,
-               resume_session: str | None = None) -> tuple[dict, str]:
-    """Run one headless turn (optionally resuming a session). Returns (result, status)."""
+               resume_session: str | None = None,
+               timeout_s: int = PER_RUN_TIMEOUT_S) -> tuple[dict, str]:
+    """Run one headless turn (optionally resuming a session). Returns (result, status).
+
+    `timeout_s` defaults to the per-run ceiling; the episode interrupt path
+    passes a short cutoff to force a real mid-stream interruption.
+    """
     import os
     cmd = ["claude", "-p", prompt, "--output-format", "json",
            "--max-turns", str(MAX_TURNS), "--allowedTools", *ALLOWED_TOOLS]
@@ -72,7 +83,7 @@ def spawn_turn(prompt: str, model: str, proxy: str, cwd: Path,
     out = ""
     try:
         proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True,
-                              text=True, timeout=PER_RUN_TIMEOUT_S)
+                              text=True, timeout=timeout_s)
         out = proc.stdout.strip()
         result = json.loads(out.splitlines()[-1]) if out else {}
         return result, "ok" if proc.returncode == 0 else f"exit{proc.returncode}"
@@ -80,6 +91,13 @@ def spawn_turn(prompt: str, model: str, proxy: str, cwd: Path,
         return {}, "timeout"
     except (json.JSONDecodeError, IndexError):
         return {"raw": out[:500]}, "unparsed"
+
+
+def _sandbox_paths(sb: dict) -> list[str]:
+    """Real in-sandbox file paths the driver can paste inline (path-paste turns)."""
+    proj = sb["project"]
+    base = sb["path"]
+    return [str(base / proj / f) for f in ("parse.py", "stats.py", "limiter.py", "cli.py")]
 
 
 def _log(data_root: Path, entry: dict) -> None:
@@ -124,57 +142,114 @@ def run_one(scenario_id: str, model: str, proxy: str, data_root: Path, rng: rand
     return entry
 
 
-def run_episode(episode_id: str, model: str, proxy: str, data_root: Path, rng: random.Random) -> dict:
-    """Multi-turn episode: step 1 is a labeled scenario from tasks.py; later steps
-    are phrased by the driver LLM (direct API, never through the proxy) and resume
-    the same session — producing episode-level traces (S15a, S6) single shots can't."""
-    from .driver import next_message
-    from .episodes import EPISODES
+def run_episode(model: str, proxy: str, data_root: Path, rng: random.Random,
+                *, n_threads: int | None = None, length: int | None = None) -> dict:
+    """One stochastic, thread-interleaved episode (see episodes.generate_episode).
 
-    ep_id = episode_id if episode_id != "random" else rng.choice(list(EPISODES))
-    ep = EPISODES[ep_id]
+    Thread seeds are labeled tasks.py scenarios (the gradable skeleton); later
+    steps are phrased by the noisy driver (direct API, never through the proxy)
+    and resume the same session. Interrupts fire a real short-cutoff turn; the
+    clarifying branch answers the agent's trailing question before drifting.
+
+    INVARIANTS preserved: provenance (session_id -> ledger), scoped
+    ALLOWED_TOOLS, --seed determinism (all draws from `rng`), mid-episode budget
+    guard, and a hard MAX_EPISODE_TURNS cap on real spawns.
+    """
+    from .driver import next_message
+    from .episodes import answer_is_question, clarifying_step, generate_episode
+
+    ep = generate_episode(rng, n_threads=n_threads, length=length)
     sb = make_sandbox(data_root / "sim-sandboxes", rng)
+    paths = _sandbox_paths(sb)
 
     turns: list[dict] = []
     session_id, last_answer = None, ""
     total_cost = driver_cost_total = 0.0
+    clarify_used = 0
     started = time.time()
 
-    for i, step in enumerate(ep["steps"]):
-        if step["kind"] == "scenario":
-            sc = pick(rng, step["scenario"])
-            prompt = sc["prompt"](sb, rng)
-        else:
-            prompt, dcost = next_message(
-                step["intent"], last_answer,
-                require_completion_marker=step.get("require_completion_marker", False),
-            )
-            driver_cost_total += dcost
-        result, status = spawn_turn(prompt, model, proxy, sb["path"], resume_session=session_id)
+    def record(step_no, prompt, status, result, expected, thread, kind):
+        nonlocal session_id, last_answer, total_cost
         session_id = result.get("session_id") or session_id
-        last_answer = str(result.get("result", ""))
+        last_answer = str(result.get("result", "")) or last_answer
         cost = result.get("total_cost_usd") or result.get("cost_usd") or 0.0
         total_cost += cost
         turns.append({
-            "step": i + 1, "prompt": prompt, "status": status,
-            "session_id": result.get("session_id"),
+            "step": step_no, "kind": kind, "thread": thread, "prompt": prompt[:500],
+            "status": status, "session_id": result.get("session_id"),
             "num_turns": result.get("num_turns"), "cost_usd": cost,
-            "expected_label": step.get("expected_label"),
+            "expected_label": expected,
         })
-        if status != "ok":
+        return status
+
+    spawned = 0
+    for step in ep.steps:
+        if spawned >= MAX_EPISODE_TURNS:
+            break
+        if spent(data_root) + total_cost >= BUDGET_CAP_USD:  # mid-episode budget guard
+            break
+
+        # clarifying branch: agent's last answer ended in a question -> answer it
+        # in-context (one extra turn) before running the scheduled drift.
+        if (step.kind == "driven" and clarify_used < MAX_CLARIFY_TURNS
+                and answer_is_question(last_answer)):
+            cs = clarifying_step(step.thread, step.topic)
+            cprompt, dcost = next_message(cs.intent, last_answer, rng=rng,
+                                          archetype=cs.archetype, sandbox_paths=paths)
+            driver_cost_total += dcost
+            res, st = spawn_turn(cprompt, model, proxy, sb["path"], resume_session=session_id)
+            spawned += 1
+            record(len(turns) + 1, cprompt, st, res, cs.expected_label, cs.thread, "clarify")
+            clarify_used += 1
+            if st != "ok":
+                break
+
+        if step.kind == "scenario":
+            sc = pick(rng, step.scenario)
+            prompt = sc["prompt"](sb, rng)
+            res, st = spawn_turn(prompt, model, proxy, sb["path"], resume_session=session_id)
+            spawned += 1
+            record(len(turns) + 1, prompt, st, res, step.expected_label, step.thread, "scenario")
+        elif step.kind == "interrupt":
+            # real interrupt: fire an on-thread request, cut it off mid-stream.
+            prompt, dcost = next_message(
+                "Continue this thread with a quick concrete request.", last_answer,
+                rng=rng, archetype="coding-ask", sandbox_paths=paths)
+            driver_cost_total += dcost
+            res, _ = spawn_turn(prompt, model, proxy, sb["path"],
+                                resume_session=session_id, timeout_s=INTERRUPT_CUTOFF_S)
+            spawned += 1
+            # log the user-visible artifact verbatim; status marks the interruption
+            record(len(turns) + 1, INTERRUPT_MARKER, "interrupted", res,
+                   step.expected_label, step.thread, "interrupt")
+            continue  # the generator already queued the organic retry as the next step
+        else:  # driven
+            prompt, dcost = next_message(
+                step.intent, last_answer,
+                require_completion_marker=step.require_completion_marker,
+                rng=rng, archetype=step.archetype, sandbox_paths=paths)
+            driver_cost_total += dcost
+            res, st = spawn_turn(prompt, model, proxy, sb["path"], resume_session=session_id)
+            spawned += 1
+            record(len(turns) + 1, prompt, st, res, step.expected_label, step.thread, "driven")
+
+        if turns and turns[-1]["status"] not in ("ok", "interrupted"):
             break
 
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "source": "simulator",
-        "episode": ep_id,
-        "maps_to": ep["maps_to"],
+        "episode": "stochastic",
+        "n_threads": ep.n_threads,
+        "thread_scenarios": ep.thread_scenarios,
+        "target_length": ep.target_length,
         "model_requested": model,
         "sandbox": str(sb["path"]),
         "duration_s": round(time.time() - started, 1),
         "session_ids": sorted({t["session_id"] for t in turns if t["session_id"]}),
-        "steps_completed": sum(1 for t in turns if t["status"] == "ok"),
-        "steps_total": len(ep["steps"]),
+        "steps_completed": sum(1 for t in turns if t["status"] in ("ok", "interrupted")),
+        "steps_total": len(ep.steps),
+        "turns_spawned": spawned,
         "cost_usd": total_cost + driver_cost_total,
         "driver_cost_usd": driver_cost_total,
         "turns": turns,
@@ -184,13 +259,14 @@ def run_episode(episode_id: str, model: str, proxy: str, data_root: Path, rng: r
 
 
 def main() -> int:
-    from .episodes import EPISODES
-
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--scenario", default="random", choices=["random", *SCENARIOS])
-    ap.add_argument("--episode", default=None, choices=["random", *EPISODES],
-                    help="run multi-turn episodes (driver LLM plays the user) instead of single shots")
+    ap.add_argument("--episode", nargs="?", const="stochastic", default=None,
+                    help="run stochastic thread-interleaved episodes (noisy driver plays "
+                         "the user) instead of single shots")
+    ap.add_argument("--threads", type=int, default=None, help="force N concurrent intent threads")
+    ap.add_argument("--length", type=int, default=None, help="force episode length (turns)")
     ap.add_argument("--model", default=None, help="single model alias (default/opus/sonnet/haiku)")
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS),
                     help="rotation when --model not given")
@@ -223,9 +299,11 @@ def main() -> int:
             break
         model = rotation[i % len(rotation)]
         if args.episode:
-            e = run_episode(args.episode, model, args.proxy, args.data_root, rng)
-            print(f"[{i+1}/{args.runs}] episode:{e['episode']:<20} model={model:<8} "
-                  f"steps={e['steps_completed']}/{e['steps_total']} "
+            e = run_episode(model, args.proxy, args.data_root, rng,
+                            n_threads=args.threads, length=args.length)
+            print(f"[{i+1}/{args.runs}] episode:{'stochastic':<12} model={model:<8} "
+                  f"threads={e['n_threads']} spawned={e['turns_spawned']}/{e['target_length']} "
+                  f"steps_ok={e['steps_completed']} "
                   f"cost=${e['cost_usd']:.4f} (driver ${e['driver_cost_usd']:.4f}) "
                   f"sessions={[s[:8] for s in e['session_ids']]}")
         else:
