@@ -96,6 +96,14 @@ def route_turn(f: TurnFeatures, session: SessionState,
                      cascade=False, layer="gate:hysteresis",
                      reason="episode already escalated — stay up until boundary")
 
+    # A bare approval/greenlight ("go ahead", "try now", "lgtm") is a continuation,
+    # not a fresh task — it carries no difficulty signal, so cold-classifying it
+    # misfires to frontier. Stick to whatever the session is already doing (default
+    # local); the trip-wires still guard it. Must precede the classifier.
+    if f.is_terse_continuation:
+        return Route(session.route or "local", cascade=True, layer="continuation",
+                     reason="terse approval/greenlight — stick to current route, don't cold-classify")
+
     # ── Layer 1: HEURISTICS — the clear ends ────────────────────────────────
     s = heuristic_score(f)
     if f.prev_turn_interrupted:

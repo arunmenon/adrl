@@ -32,6 +32,15 @@ SCOPE_BROAD = re.compile(
     re.I)
 SCOPE_NARROW = re.compile(r"\b(this (function|file|line|variable|test)|just|only)\b", re.I)
 
+# A whole-message approval / continuation ("go ahead", "do it", "try now", "lgtm").
+# These are the user greenlighting the agent's proposed action, NOT a fresh task —
+# routing them by cold difficulty misfires (a 2-word "go ahead" has no signal), so
+# the policy sticks them to the current route instead of classifying them.
+TERSE_CONTINUE = re.compile(
+    r"^\W*(go\s*ahead|do it|do so|go for it|ok(ay)?|ye(s|p|ah)|sure|lgtm|"
+    r"ship it|proceed|continue|carry on|try now|and now|next|fine|please do|"
+    r"sounds good|do that|make it so)\W*$", re.I)
+
 
 @dataclass
 class TurnFeatures:
@@ -45,6 +54,7 @@ class TurnFeatures:
     narrow_scope: bool = False
     # context
     context_tokens: int = 0
+    is_terse_continuation: bool = False   # a bare approval/greenlight of prior work
     # trajectory (the signal chat-routers don't have)
     turn_index: int = 0
     recent_errors: int = 0           # is_error tool_results in this session's recent turns
@@ -91,6 +101,7 @@ def extract(instruction_text: str, *, context_tokens: int = 0, turn_index: int =
     text = instruction_text or ""
     return TurnFeatures(
         verb_class=verb, verb_score=score, instruction_text=text,
+        is_terse_continuation=bool(TERSE_CONTINUE.match(text.strip())),
         broad_scope=bool(SCOPE_BROAD.search(text)),
         narrow_scope=bool(SCOPE_NARROW.search(text)),
         context_tokens=context_tokens, turn_index=turn_index,

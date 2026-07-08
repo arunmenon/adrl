@@ -60,3 +60,18 @@ def test_classifier_not_consulted_on_clear_heuristic_end():
     called = []
     r = route_turn(f, SessionState("s"), classifier=lambda t: called.append(t))
     assert r.layer == "heuristic" and r.rung == "local" and not called
+
+
+def test_terse_approval_sticks_not_frontier():
+    # "go ahead" / "do it" must NOT be cold-classified to frontier
+    for msg in ("go ahead", "Do it", "try now", "lgtm", "and now", "proceed"):
+        f = extract(msg, context_tokens=3000)
+        assert f.is_terse_continuation, msg
+        # even with a classifier that would say frontier, the continuation rule wins first
+        r = route_turn(f, SessionState("s", route="local"),
+                       classifier=lambda t: StubVerdict("hard", True))
+        assert r.layer == "continuation" and r.rung == "local", f"{msg} -> {r.rung}/{r.layer}"
+
+def test_real_task_not_mistaken_for_approval():
+    f = extract("fix the failing test", context_tokens=3000)
+    assert not f.is_terse_continuation
