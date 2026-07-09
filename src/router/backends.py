@@ -277,11 +277,19 @@ def for_role(role: str, *, config_path: Path = DEFAULT_CONFIG_PATH):
     function must never raise on bad config (fail-safe extends to setup).
     """
     spec = dict(ROLE_DEFAULTS.get(role, ROLE_DEFAULTS["classifier"]))
-    spec.update((_load_config(config_path).get(role) or {}))
+    role_cfg = _load_config(config_path).get(role)
+    if isinstance(role_cfg, dict):        # a valid-but-wrong shape (list/str) is
+        spec.update(role_cfg)             # ignored, not fatal (review finding)
+
+    def _num(v, default):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
 
     def build(one: dict[str, Any]):
         cls = ADAPTERS.get(str(one.get("adapter", "ollama")), OllamaBackend)
-        kwargs: dict[str, Any] = {"timeout": float(one.get("timeout", DEFAULT_TIMEOUT))}
+        kwargs: dict[str, Any] = {"timeout": _num(one.get("timeout"), DEFAULT_TIMEOUT)}
         if one.get("base_url"):
             kwargs["base_url"] = str(one["base_url"])
         elif cls is OpenAICompatBackend:

@@ -401,3 +401,29 @@ def test_build_report(tmp_path):
     assert "closed_turn: 1" in report
     assert "pending: 1" in report
     assert "healthy: yes" in report
+
+
+# ── review-fix regressions ─────────────────────────────────────────────────────
+
+def test_bad_embedding_leaves_no_partial_decision(provider):
+    """Finding #1: a bad embedding must not persist a half-written decision."""
+    assert provider.record_decision(
+        make_decision("bad"), embedding=["not", "a", "number"]) is None
+    assert provider.stats()["decisions"] == 0          # rolled back, no orphan
+    # and a subsequent good write commits cleanly (would flush the orphan if any)
+    assert provider.record_decision(make_decision("good")) == "good"
+    assert provider.stats()["decisions"] == 1
+
+
+def test_outcome_update_refreshes_knn_projection(provider):
+    """Finding #5: an in-place outcome change (same row counts) must invalidate
+    the cached kNN projection."""
+    vec = [1.0, 0.0, 0.0, 0.0]
+    provider.record_decision(make_decision("e1"), embedding=vec)
+    provider.attach_outcome("e1", make_outcome("closed_turn", outcome_proxy_hard=False))
+    first = provider.similar_turns(vec, k=1)
+    assert first and first[0].outcome_proxy_hard is False
+    # promote to closed_final flipping outcome_proxy_hard — row counts unchanged
+    provider.attach_outcome("e1", make_outcome("closed_final", outcome_proxy_hard=True))
+    second = provider.similar_turns(vec, k=1)
+    assert second and second[0].outcome_proxy_hard is True   # projection refreshed

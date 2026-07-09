@@ -124,6 +124,11 @@ class SqliteProvider(_ProviderBase):
         self._projection_fingerprint: Optional[tuple] = None
         self._projection_matrix: Optional[np.ndarray] = None
         self._projection_meta: list[dict] = []
+        # Monotonic counter bumped on every outcome MUTATION (attach/finalize).
+        # Row-count fingerprints miss in-place UPDATEs to escalated /
+        # outcome_proxy_hard (review finding), so this makes the projection
+        # refresh after any outcome change on this provider.
+        self._outcome_writes = 0
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -137,6 +142,15 @@ class SqliteProvider(_ProviderBase):
 
     # ── writes ───────────────────────────────────────────────────────────
 
+    def _safe_rollback(self) -> None:
+        """Discard a failed, uncommitted transaction so its partial rows can
+        never be flushed by a later commit (review finding). Never raises."""
+        try:
+            if self._conn is not None:
+                self._conn.rollback()
+        except Exception:
+            pass
+
     def record_decision(
         self, decision: DecisionEvent, embedding: Optional[list[float]] = None
     ) -> Optional[str]:
@@ -148,11 +162,17 @@ class SqliteProvider(_ProviderBase):
         if self._conn is None:
             return None
         try:
-            if decision.instr_sha256 is None:
-                # Defense-in-depth (review finding): a pinned/secret turn must
-                # never persist an embedding, even if a caller bypasses the
-                # facade's gate. Inside the try so garbage input stays fail-safe.
-                embedding = None
+            # Convert + validate the embedding BEFORE any SQL write, and drop it
+            # for privacy-excluded turns. A bad embedding must never leave a
+            # half-written decision behind (review finding): if np.asarray had
+            # raised AFTER the INSERTs, the uncommitted rows would be flushed by
+            # a later commit(). Preparing the BLOB first — plus the rollback
+            # below — makes the whole write atomic.
+            emb_blob: Optional[tuple[int, bytes]] = None
+            if decision.instr_sha256 is not None and embedding is not None:
+                vector = np.asarray(embedding, dtype="<f4")
+                emb_blob = (int(vector.shape[0]), vector.tobytes())
+
             self._conn.execute(
                 "INSERT OR IGNORE INTO decisions VALUES "
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -183,16 +203,16 @@ class SqliteProvider(_ProviderBase):
                 "VALUES (?, 'pending', 0, 0, 0, 0, 0.0, 0.0, 0)",
                 (decision.route_id,),
             )
-            if embedding is not None:
-                vector = np.asarray(embedding, dtype="<f4")
+            if emb_blob is not None:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO embeddings (route_id, dim, vec) "
                     "VALUES (?,?,?)",
-                    (decision.route_id, int(vector.shape[0]), vector.tobytes()),
+                    (decision.route_id, emb_blob[0], emb_blob[1]),
                 )
             self._conn.commit()
             return decision.route_id
         except Exception:
+            self._safe_rollback()
             return None
 
     def attach_outcome(self, route_id: str, outcome: OutcomeEvent) -> bool:
@@ -234,8 +254,10 @@ class SqliteProvider(_ProviderBase):
                 ),
             )
             self._conn.commit()
+            self._outcome_writes += 1   # invalidate stale kNN projection
             return True
         except Exception:
+            self._safe_rollback()
             return False
 
     def finalize_turn(
@@ -264,23 +286,28 @@ class SqliteProvider(_ProviderBase):
                 (int(bool(prev_interrupted)), int(bool(prev_retried)), row[0]),
             )
             self._conn.commit()
+            self._outcome_writes += 1   # invalidate stale kNN projection
             return cursor.rowcount
         except Exception:
+            self._safe_rollback()
             return 0
 
     # ── retrieval projection ─────────────────────────────────────────────
 
     def _projection_current_fingerprint(self) -> Optional[tuple]:
-        """Cheap staleness check: (embeddings rowcount, closed-outcome rowcount).
+        """Cheap staleness check: (embeddings rowcount, closed-outcome rowcount,
+        outcome-mutation counter).
 
-        Catches both new embedding rows and pending->closed promotions without
-        scanning any BLOBs."""
+        The two counts catch new embedding rows and pending->closed promotions;
+        the mutation counter (bumped on every attach/finalize) additionally
+        catches in-place UPDATEs to escalated / outcome_proxy_hard that leave
+        the row counts unchanged (review finding) — without scanning any BLOBs."""
         row = self._conn.execute(
             "SELECT (SELECT COUNT(*) FROM embeddings), "
             "(SELECT COUNT(*) FROM outcomes WHERE status IN (?, ?))",
             _CLOSED_STATUSES,
         ).fetchone()
-        return (row[0], row[1])
+        return (row[0], row[1], self._outcome_writes)
 
     def _refresh_projection(self) -> None:
         """Rebuild the normalized in-RAM matrix + aligned metadata from the

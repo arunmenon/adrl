@@ -174,3 +174,11 @@ def test_classifier_backend_failure_falls_back_to_none(monkeypatch):
     monkeypatch.setattr(backends, "http_post_json",
                         lambda endpoint, payload, timeout: None)
     assert classify_intent_llm("fix it", backend=OllamaBackend("m")) is None
+
+
+def test_for_role_wrong_shape_config_falls_back(tmp_path):
+    """Finding #2: a valid-YAML but wrong-shape role (list/str) must not raise."""
+    cfg = tmp_path / "backends.yaml"
+    cfg.write_text("classifier: [this, is, wrong]\n")
+    adapter = for_role("classifier", config_path=cfg)
+    assert isinstance(adapter, OllamaBackend)   # defaults, no exception

@@ -176,6 +176,7 @@ def generate_episode(
     length: Optional[int] = None,
     switch_p: float = 0.65,
     interrupt_rate: float = 0.025,
+    allowed_scenarios: Optional[set] = None,
 ) -> Episode:
     """Build one thread-interleaved episode plan.
 
@@ -183,8 +184,15 @@ def generate_episode(
     thread (bursty switching); staying produces a sticky run (local coherence).
     High switch_p is what drives the global median consec-turn Jaccard toward 0
     while sticky runs keep neighbouring same-thread turns coherent.
+
+    `allowed_scenarios` restricts thread seeds to scenarios applicable to the
+    sandbox's archetype (review finding: a terraform sandbox must not be seeded
+    with a Python-only task); falls back to all threads if the filter is empty.
     """
     scenarios = list(THREAD_LIBRARY)
+    if allowed_scenarios is not None:
+        filtered = [s for s in scenarios if s in allowed_scenarios]
+        scenarios = filtered or scenarios   # never strand: fall back to all
     n_threads = n_threads or rng.randint(2, 4)
     n_threads = min(n_threads, len(scenarios))
     chosen = rng.sample(scenarios, n_threads)

@@ -86,3 +86,12 @@ def test_build_renders_markdown(seeded):
 def test_empty_db_is_safe(tmp_path):
     assert generate(tmp_path / "nope.db") == []
     assert "No memory" in build(tmp_path / "nope.db")
+
+
+def test_uninitialized_db_is_safe(tmp_path):
+    """Finding #6: an existing but schema-less SQLite file is 'no memory'."""
+    import sqlite3
+    db = tmp_path / "empty.db"
+    sqlite3.connect(str(db)).close()   # exists, but no `decisions` table
+    assert generate(db) == []
+    assert "No memory" in build(db)

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .sandbox import make_sandbox
-from .tasks import SCENARIOS, pick
+from .tasks import SCENARIOS, applicable, pick
 
 BUDGET_CAP_USD = 25.00  # decision D2 — hard cap, all simulator runs ever
 PER_RUN_TIMEOUT_S = 600
@@ -93,11 +93,24 @@ def spawn_turn(prompt: str, model: str, proxy: str, cwd: Path,
         return {"raw": out[:500]}, "unparsed"
 
 
-def _sandbox_paths(sb: dict) -> list[str]:
-    """Real in-sandbox file paths the driver can paste inline (path-paste turns)."""
-    proj = sb["project"]
-    base = sb["path"]
-    return [str(base / proj / f) for f in ("parse.py", "stats.py", "limiter.py", "cli.py")]
+_PASTE_EXTS = {".py", ".ts", ".tsx", ".sql", ".prisma", ".tf", ".md", ".json",
+               ".yaml", ".yml"}
+
+
+def _sandbox_paths(sb: dict, limit: int = 5) -> list[str]:
+    """Real in-sandbox file paths the driver can paste inline (path-paste turns).
+
+    Walks the ACTUAL sandbox so every archetype yields real, existing paths
+    (review finding: hardcoded parse.py/stats.py don't exist in a Next.js or
+    terraform sandbox — those false paths broke path-paste realism). The
+    archetype's dominant-language files are preferred first.
+    """
+    base = Path(sb["path"])
+    dom = sb.get("dominant_ext")
+    found = [p for p in base.rglob("*")
+             if p.is_file() and ".git" not in p.parts and p.suffix in _PASTE_EXTS]
+    found.sort(key=lambda p: (p.suffix != dom, str(p)))   # dominant ext first, deterministic
+    return [str(p) for p in found[:limit]]
 
 
 def _log(data_root: Path, entry: dict) -> None:
@@ -107,7 +120,9 @@ def _log(data_root: Path, entry: dict) -> None:
 
 def run_one(scenario_id: str, model: str, proxy: str, data_root: Path, rng: random.Random) -> dict:
     sb = make_sandbox(data_root / "sim-sandboxes", rng)
-    sc = pick(rng, scenario_id)
+    # Pass sb so a random pick is restricted to the sandbox's archetype (review
+    # finding); an explicit --scenario is still honoured as the user's choice.
+    sc = pick(rng, scenario_id, sb)
     prompt = sc["prompt"](sb, rng)
 
     if sc["id"] == "commit_msg":  # needs staged changes to talk about
@@ -158,8 +173,12 @@ def run_episode(model: str, proxy: str, data_root: Path, rng: random.Random,
     from .driver import next_message
     from .episodes import answer_is_question, clarifying_step, generate_episode
 
-    ep = generate_episode(rng, n_threads=n_threads, length=length)
+    # Build the sandbox FIRST so the episode's thread seeds can be restricted to
+    # scenarios applicable to its archetype (review finding) — otherwise a
+    # docs/terraform sandbox gets Python/Next.js tasks and becomes ungradable.
     sb = make_sandbox(data_root / "sim-sandboxes", rng)
+    ep = generate_episode(rng, n_threads=n_threads, length=length,
+                          allowed_scenarios=set(applicable(sb)))
     paths = _sandbox_paths(sb)
 
     turns: list[dict] = []

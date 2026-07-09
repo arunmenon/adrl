@@ -66,6 +66,10 @@ def generate(db_path: Path = DEFAULT_DB) -> list[Insight]:
     conn = sqlite3.connect(str(db_path))
     try:
         return _generate(conn)
+    except sqlite3.OperationalError:
+        # An existing but uninitialized/foreign SQLite file (no `decisions`
+        # table) is "no memory", not a crash (review finding).
+        return []
     finally:
         conn.close()
 
