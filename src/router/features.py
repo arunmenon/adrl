@@ -74,22 +74,38 @@ def classify_intent(text: str) -> tuple[str, float]:
     return "unknown", 0.5
 
 
-def heuristic_score(f: TurnFeatures) -> float:
-    """Difficulty in [0,1]. Deliberately dumb: weighted facts, no learning.
-    Thresholds T_EASY/T_HARD (policy.py) cut this into three bands."""
+CONTEXT_TOKEN_THRESHOLD = 20_000  # big working sets correlate with harder work
+
+
+def intent_score(f: TurnFeatures) -> float:
+    """Intent-only difficulty in [0,1]: verb base score + scope adjustments +
+    the big-context nudge. NO trajectory signals (edit failures, recent errors,
+    prior interrupt) — this is what the instruction ALONE says about difficulty.
+
+    Single source shared by ``heuristic_score`` (live path, adds trajectory on
+    top) and ``shadow_classifier.intent_only_score`` (offline harness), so the
+    two can never drift apart again.
+    """
     s = f.verb_score
     if f.broad_scope:
         s += 0.20
     if f.narrow_scope:
         s -= 0.10
+    if f.context_tokens > CONTEXT_TOKEN_THRESHOLD:
+        s += 0.10
+    return max(0.0, min(1.0, s))
+
+
+def heuristic_score(f: TurnFeatures) -> float:
+    """Difficulty in [0,1]. Deliberately dumb: weighted facts, no learning.
+    Thresholds T_EASY/T_HARD (policy.py) cut this into three bands."""
+    s = intent_score(f)
     if f.recent_edit_failures >= 1:
         s += 0.15                     # session already struggling with edits
     if f.recent_errors >= 3:
         s += 0.10
     if f.prev_turn_interrupted:
         s += 0.30                     # escalate-on-retry: the strongest signal (§5.5)
-    if f.context_tokens > 20_000:
-        s += 0.10                     # big working sets correlate with harder work
     return max(0.0, min(1.0, s))
 
 

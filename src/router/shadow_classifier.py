@@ -37,7 +37,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .features import SCOPE_BROAD, SCOPE_NARROW, classify_intent
+from .features import CONTEXT_TOKEN_THRESHOLD, classify_intent, extract, intent_score  # noqa: F401 — CONTEXT_TOKEN_THRESHOLD re-exported (moved to features.py)
+from .outcomes import outcome_proxy_hard  # noqa: F401 — canonical home is outcomes.py; re-exported for existing callers/tests
 from .policy import T_EASY, T_HARD
 
 # Sibling module (written concurrently). Contract:
@@ -52,7 +53,6 @@ try:  # pragma: no cover - trivial import shim
 except Exception:  # sibling not written yet / import-time failure
     classify_intent_llm = None
 
-CONTEXT_TOKEN_THRESHOLD = 20_000
 STRATIFY_SEED = 1729
 
 
@@ -65,44 +65,22 @@ def ctx_estimate(row: dict) -> int:
 def intent_only_score(instruction_text: str, context_tokens: int) -> float:
     """The intent-only difficulty score used to define regex certainty.
 
-    Replicates the *non-trajectory* part of features.heuristic_score:
-    verb base score + scope adjustments + a big-context nudge. Trajectory
-    signals (edit failures, recent errors, prior interrupt) are deliberately
-    excluded — "regex-uncertain" is about whether the INTENT alone confidently
-    places the turn, which is exactly the gap the classifier is meant to fill.
+    Delegates to ``features.intent_score`` — the *non-trajectory* part of
+    features.heuristic_score (verb base score + scope adjustments + a
+    big-context nudge; the local copy this module once carried is gone).
+    Trajectory signals (edit failures, recent errors, prior interrupt) are
+    deliberately excluded — "regex-uncertain" is about whether the INTENT
+    alone confidently places the turn, which is exactly the gap the
+    classifier is meant to fill.
     """
-    text = instruction_text or ""
-    _, base = classify_intent(text)
-    score = base
-    if SCOPE_BROAD.search(text):
-        score += 0.20
-    if SCOPE_NARROW.search(text):
-        score -= 0.10
-    if context_tokens > CONTEXT_TOKEN_THRESHOLD:
-        score += 0.10
-    return max(0.0, min(1.0, score))
+    return intent_score(extract(instruction_text or "",
+                                context_tokens=context_tokens))
 
 
 def is_regex_uncertain(verb_class: str, intent_score: float) -> bool:
     """The regex abstains: no recognized verb, or the score lands in the band
     the heuristic layer can't confidently cut (T_EASY <= s <= T_HARD)."""
     return verb_class == "unknown" or (T_EASY <= intent_score <= T_HARD)
-
-
-def outcome_proxy_hard(row: dict) -> bool:
-    """Weak execution-friction proxy for 'this turn really was hard'.
-
-    Same definition the bake-off used: any edit-apply failure, any errored tool
-    result, a user interrupt, or a runaway (>=10 continuations). Non-validating
-    (see classifier-bakeoff.md caveats) but the only ground-truth-ish signal we
-    have for whether frontier help was warranted.
-    """
-    return (
-        (row.get("n_edit_failures") or 0) >= 1
-        or (row.get("n_error_results") or 0) >= 1
-        or bool(row.get("interrupted"))
-        or (row.get("n_continuations") or 0) >= 10
-    )
 
 
 def load_main_user_turns(turns_path: Path) -> list[dict]:
