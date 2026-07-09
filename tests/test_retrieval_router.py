@@ -40,11 +40,14 @@ def test_neighbor_went_hard():
 
 
 def test_decide_frontier_when_neighbors_mostly_hard():
+    # 4 hard + 1 easy, all sim 0.9, recency 1.0 (ts==now) -> hard_weight = 4*0.9,
+    # total = 5*0.9, fraction 0.8. Assert the weighting math, not just > 0.
     neighbors = [_n(0.9, hard=True) for _ in range(4)] + [_n(0.9, hard=False)]
     verdict = rr.decide(neighbors, now=0.0)
     assert verdict.needs_frontier
     assert verdict.tier == "retrieval:frontier"
-    assert verdict.hard_weight > 0
+    assert abs(verdict.hard_weight - 4 * 0.9) < 1e-6
+    assert abs(verdict.total_weight - 5 * 0.9) < 1e-6
 
 
 def test_decide_local_when_neighbors_mostly_easy():
@@ -52,6 +55,21 @@ def test_decide_local_when_neighbors_mostly_easy():
     verdict = rr.decide(neighbors, now=0.0)
     assert not verdict.needs_frontier
     assert verdict.tier == "retrieval:local"
+    assert abs(verdict.hard_weight - 1 * 0.9) < 1e-6
+
+
+def test_decide_threshold_is_inclusive_at_half():
+    # exactly 50% hard-weight -> frontier (>= threshold: a tie escalates for safety)
+    neighbors = [_n(0.9, hard=True), _n(0.9, hard=False)]
+    assert rr.decide(neighbors, now=0.0, hard_vote_threshold=0.5).needs_frontier
+
+
+def test_decide_threshold_actually_matters():
+    # fraction 1/3 hard: local at the 0.5 default, frontier at a 0.3 threshold.
+    # Proves HARD_VOTE_THRESHOLD is consulted, not a hardcoded 0.5 tipping point.
+    neighbors = [_n(0.9, hard=True), _n(0.9, hard=False), _n(0.9, hard=False)]
+    assert not rr.decide(neighbors, now=0.0, hard_vote_threshold=0.5).needs_frontier
+    assert rr.decide(neighbors, now=0.0, hard_vote_threshold=0.3).needs_frontier
 
 
 def test_recency_downweights_stale_hard_cluster():
@@ -165,7 +183,15 @@ def _seed(db_path: Path, rows: list[dict]) -> None:
 
 
 _A = [1.0, 0.0, 0.0, 0.0]   # cluster A direction
-_B = [0.0, 1.0, 0.0, 0.0]   # cluster B direction (orthogonal -> cosine 0)
+_B = [0.0, 1.0, 0.0, 0.0]   # cluster B direction (orthogonal -> cosine 0, below floor)
+
+
+def _filler(n: int = 8, *, hard: bool = False) -> list[dict]:
+    """Cluster-B closed rows in distinct sessions, purely to clear the
+    MIN_FINALIZED cold-start gate. Being orthogonal to _A they never become
+    above-floor neighbors of an _A target, so they don't perturb the vote."""
+    return [{"vec": _B, "layer": "heuristic", "hard": hard, "session": f"f{i}"}
+            for i in range(n)]
 
 
 def test_shadow_empty_db_insufficient(tmp_path):
@@ -173,14 +199,26 @@ def test_shadow_empty_db_insufficient(tmp_path):
     assert "INSUFFICIENT DATA" in report
 
 
-def test_shadow_true_positive_on_hard_cluster(tmp_path):
+def test_shadow_cold_start_gate_abstains(tmp_path):
+    # 7 finalized (< MIN_FINALIZED=8): the live resolver abstains on every query,
+    # so shadow must report zero evaluated even with a clean hard cluster.
     db = tmp_path / "m.db"
-    # 1 middle-band HARD turn surrounded by 6 hard cluster-A neighbors (each a
-    # distinct session so none is excluded as same-session). Vote -> frontier,
-    # actual hard -> TP.
-    rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "target"}]
+    rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "t"}]
     rows += [{"vec": _A, "layer": "heuristic", "hard": True, "session": f"n{i}"}
              for i in range(6)]
+    _seed(db, rows)  # 7 finalized total
+    result = sr.evaluate(db, now=100.0)
+    assert result.finalized == 7
+    assert result.evaluated == 0        # cold-start gate, not neighbor scarcity
+
+
+def test_shadow_true_positive_on_hard_cluster(tmp_path):
+    db = tmp_path / "m.db"
+    # target + 8 hard cluster-A neighbors (distinct sessions) -> past cold-start,
+    # vote frontier, actual hard -> TP. Would fail if decide() returned local.
+    rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "target"}]
+    rows += [{"vec": _A, "layer": "heuristic", "hard": True, "session": f"n{i}"}
+             for i in range(8)]
     _seed(db, rows)
     result = sr.evaluate(db, now=100.0)
     assert result.middle_total == 1
@@ -188,42 +226,106 @@ def test_shadow_true_positive_on_hard_cluster(tmp_path):
     assert result.tp == 1 and result.fn == 0
 
 
+def test_shadow_true_negative_on_easy_cluster(tmp_path):
+    db = tmp_path / "m.db"
+    # easy target + 8 easy neighbors -> vote local, actual easy -> TN (would fail
+    # if the vote inverted or the hardness label were wrong).
+    rows = [{"vec": _A, "layer": "middle_default", "hard": False, "session": "target"}]
+    rows += [{"vec": _A, "layer": "heuristic", "hard": False, "session": f"n{i}"}
+             for i in range(8)]
+    _seed(db, rows)
+    result = sr.evaluate(db, now=100.0)
+    assert result.evaluated == 1
+    assert result.tn == 1 and result.fp == 0
+
+
+def test_shadow_similarity_floor_excludes_below_threshold(tmp_path):
+    db = tmp_path / "m.db"
+    # cluster-A target; 8 cluster-B neighbors are orthogonal (cosine 0 < 0.75
+    # floor) -> all filtered by the floor -> abstain, though they clear the count.
+    # Exercises the floor half of _neighbors selection (was uncovered).
+    rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "t"}]
+    rows += [{"vec": _B, "layer": "heuristic", "hard": True, "session": f"n{i}"}
+             for i in range(8)]
+    _seed(db, rows)
+    result = sr.evaluate(db, now=100.0)
+    assert result.middle_total == 1
+    assert result.evaluated == 0        # 8 neighbors, all below the 0.75 floor
+
+
 def test_shadow_leave_one_out_excludes_same_session(tmp_path):
     db = tmp_path / "m.db"
-    # target + a same-session twin + only 4 other cluster-A neighbors. Excluding
-    # the twin leaves 4 (< MIN_NEIGHBORS=5) -> abstain. Proves same-session skip.
+    # target + a same-session twin + only 4 OTHER-session cluster-A neighbors,
+    # plus filler to clear cold-start. Excluding the twin leaves 4 (< 5) -> abstain.
     rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "shared"}]
     rows += [{"vec": _A, "layer": "heuristic", "hard": True, "session": "shared"}]  # twin
     rows += [{"vec": _A, "layer": "heuristic", "hard": True, "session": f"n{i}"}
              for i in range(4)]
+    rows += _filler(8)
     _seed(db, rows)
-    result = sr.evaluate(db, now=100.0)
-    assert result.middle_total == 1
-    assert result.evaluated == 0        # abstained: twin excluded, 4 < 5
-    assert result.abstained == 1
+    assert sr.evaluate(db, now=100.0).evaluated == 0    # twin excluded, 4 < 5
+
+    # control: one more DISTINCT-session neighbor -> 5 -> evaluates (isolates the
+    # same-session skip as the cause, not a count fluke).
+    db2 = tmp_path / "m2.db"
+    _seed(db2, rows + [{"vec": _A, "layer": "heuristic", "hard": True,
+                        "session": "extra"}])
+    assert sr.evaluate(db2, now=100.0).evaluated == 1
 
 
 def test_shadow_firewall_excludes_simulator_from_organic_target(tmp_path):
     db = tmp_path / "m.db"
-    # organic middle target with 6 SIMULATOR cluster-A neighbors -> all firewalled
-    # -> abstain.
+    # organic middle target + 8 SIMULATOR cluster-A neighbors -> all firewalled.
     rows = [{"vec": _A, "layer": "middle_default", "hard": True,
              "source": "organic", "session": "t"}]
     rows += [{"vec": _A, "layer": "heuristic", "hard": True,
-              "source": "simulator", "session": f"n{i}"} for i in range(6)]
+              "source": "simulator", "session": f"n{i}"} for i in range(8)]
     _seed(db, rows)
     result = sr.evaluate(db, now=100.0)
-    assert result.evaluated == 0
+    assert result.middle_total == 1    # target IS detected as middle-band...
+    assert result.evaluated == 0       # ...but every neighbor is firewalled
 
-    report = sr.build(db)
-    assert "INSUFFICIENT DATA" in report   # 1 middle turn << 300
+    # control: a SIMULATOR target keeps the simulator neighbors and evaluates,
+    # proving the abstention above is the firewall, not neighbor scarcity.
+    db2 = tmp_path / "m2.db"
+    rows2 = [{"vec": _A, "layer": "middle_default", "hard": True,
+              "source": "simulator", "session": "t"}]
+    rows2 += [{"vec": _A, "layer": "heuristic", "hard": True,
+               "source": "simulator", "session": f"n{i}"} for i in range(8)]
+    _seed(db2, rows2)
+    assert sr.evaluate(db2, now=100.0).evaluated == 1
+
+
+def test_shadow_classifier_layer_counts_as_middle(tmp_path):
+    db = tmp_path / "m.db"
+    rows = [{"vec": _A, "layer": "classifier", "hard": False, "session": "t"}]
+    rows += [{"vec": _A, "layer": "heuristic", "hard": False, "session": f"n{i}"}
+             for i in range(8)]
+    _seed(db, rows)
+    assert sr.evaluate(db, now=100.0).middle_total == 1
 
 
 def test_shadow_only_middle_band_turns_are_scored(tmp_path):
     db = tmp_path / "m.db"
-    # a heuristic-layer turn is never a target even with plenty of neighbors
     rows = [{"vec": _A, "layer": "heuristic", "hard": True, "session": f"n{i}"}
             for i in range(8)]
     _seed(db, rows)
+    assert sr.evaluate(db, now=100.0).middle_total == 0
+
+
+def test_shadow_graduation_gate_keys_on_evaluated_not_middle_total(tmp_path):
+    db = tmp_path / "m.db"
+    # >= GRADUATION_MIN_MIDDLE middle targets, but ALL share one session so
+    # leave-one-out excludes every neighbor -> evaluated == 0. If the gate keyed
+    # on middle_total it would wrongly print SUFFICIENT SAMPLE.
+    n = rr.GRADUATION_MIN_MIDDLE
+    rows = [{"vec": _A, "layer": "middle_default", "hard": False, "session": "s"}
+            for _ in range(n)]
+    rows += _filler(8)   # distinct sessions, below floor: clear cold-start only
+    _seed(db, rows)
     result = sr.evaluate(db, now=100.0)
-    assert result.middle_total == 0
+    assert result.middle_total >= rr.GRADUATION_MIN_MIDDLE
+    assert result.evaluated == 0
+    report = sr.build(db)
+    assert "INSUFFICIENT DATA" in report
+    assert "SUFFICIENT SAMPLE" not in report

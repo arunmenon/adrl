@@ -1,4 +1,4 @@
-"""WS4 — the retrieval router: route the ambiguous middle by experience.
+"""WS4 - the retrieval router: route the ambiguous middle by experience.
 
 The three-layer policy resolves clear-easy and clear-hard with hand rules and
 leaves the ambiguous middle to a stub (``middle_default``) or the LLM classifier.
@@ -13,29 +13,29 @@ cold classifier call, *look up how turns like this one actually went* and vote.
 
 It plugs into the SAME injected ``classifier`` slot ``route_turn`` already
 consults (``resolver(text) -> verdict|None`` with ``.needs_frontier`` / ``.tier``),
-so wiring it live is a one-line injection — but it is SHADOW-FIRST: not wired
+so wiring it live is a one-line injection - but it is SHADOW-FIRST: not wired
 into the live policy until ``shadow_retrieval`` shows it beats both the LLM
 classifier and the best-single-model baseline on a cost-aware objective without
 regressing frontier recall (the graduation gate).
 
 Why this generalizes where regex does not: it needs no lexicon and no retraining
-— every new finalized outcome immediately sharpens the next similar decision.
+- every new finalized outcome immediately sharpens the next similar decision.
 
 SELECTION-BIAS GUARDS built in:
-  * cold-start abstention — needs >= MIN_NEIGHBORS confident neighbors AND a
+  * cold-start abstention - needs >= MIN_NEIGHBORS confident neighbors AND a
     minimum of finalized outcomes in memory, else abstains (falls through to the
     classifier / middle_default). Early behavior is therefore identical to today.
-  * is_sim firewall — when serving ORGANIC traffic, synthetic (simulator)
+  * is_sim firewall - when serving ORGANIC traffic, synthetic (simulator)
     neighbors are dropped so fuel runs can never flood a real-traffic vote. A
     simulator query may use all neighbors (that is what shadow/fuel wants).
-  * recency weighting — older outcomes decay (policy/model regimes drift), so a
+  * recency weighting - older outcomes decay (policy/model regimes drift), so a
     stale cluster cannot outvote fresh evidence.
 
-NOT yet fully wired (documented, not faked): per-session neighbor caps and
-instr_sha256 dedup need ``session_id`` / ``instr_sha256`` on ``NeighborTurn`` +
-the projection; until the projection carries them a single chatty session could
-over-weight the vote. Tracked for the projection-enrichment follow-up; the
-firewall + similarity floor bound the risk meanwhile.
+NOT yet fully wired (documented, not faked): ``NeighborTurn`` now carries
+``session_id`` (the shadow harness uses it for leave-one-out), so per-session
+vote caps are a small follow-up; instr_sha256 dedup still needs that field on the
+projection. Until per-session caps land, a single chatty session could
+over-weight the vote; the firewall + similarity floor bound the risk meanwhile.
 
 FAIL-SAFE: any failure -> abstain (``None``). A memory outage never blocks a
 route; it just removes this layer's opinion.
@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from .memory_ports import NeighborTurn
+from .outcomes import went_hard
 
 # ── shared knobs (shadow harness imports these so live == evaluated) ──────────
 K = 12
@@ -75,7 +76,7 @@ class RetrievalVerdict:
 
 @dataclass
 class ResolveTrace:
-    """Provenance of the most recent ``resolve`` — exposed as ``resolver.last``
+    """Provenance of the most recent ``resolve`` - exposed as ``resolver.last``
     for the shadow harness and live debugging. Never part of the routing path."""
 
     abstained: bool
@@ -96,8 +97,48 @@ def recency_weight(ts: float, now: float, halflife_s: float = RECENCY_HALFLIFE_S
 
 
 def neighbor_went_hard(neighbor: NeighborTurn) -> bool:
-    """A neighbor 'needed frontier' if it escalated or its outcome proxy is hard."""
-    return bool(neighbor.escalated) or bool(neighbor.outcome_proxy_hard)
+    """A neighbor 'needed frontier' if it went hard by the shared three-signal
+    label (escalation, user retry, or friction proxy). NeighborTurn now carries
+    ``user_retried``, so the vote scores neighbors by the SAME definition the
+    ground truth uses (was previously a two-signal copy that biased recall)."""
+    return went_hard(neighbor.escalated, neighbor.user_retried,
+                     neighbor.outcome_proxy_hard)
+
+
+def passes_filter(neighbor: NeighborTurn, *, query_source: str,
+                  min_similarity: float) -> bool:
+    """The live keep-rule: confident enough (>= floor) AND not a synthetic vote
+    leaking into organic (is_sim firewall). A free function so the shadow harness
+    filters identically to the resolver."""
+    if float(neighbor.similarity) < min_similarity:
+        return False
+    if query_source == "organic" and neighbor.source == "simulator":
+        return False   # is_sim firewall
+    return True
+
+
+def evaluate_neighbors(raw: Sequence[NeighborTurn], *, now: float,
+                       query_source: str = "organic",
+                       min_neighbors: int = MIN_NEIGHBORS,
+                       min_similarity: float = MIN_SIMILARITY,
+                       hard_vote_threshold: float = HARD_VOTE_THRESHOLD,
+                       halflife_s: float = RECENCY_HALFLIFE_S,
+                       ) -> tuple[Optional[RetrievalVerdict], int]:
+    """Filter a TOP-K neighbor list (floor + firewall) then vote, or abstain.
+
+    Returns ``(verdict | None, n_kept)``. This is the shared decision core the
+    live resolver AND the shadow harness both call, so the filter ordering, the
+    neighbor-count gate, and the vote can never drift between evaluation and
+    production. The caller supplies ``raw`` ALREADY capped to top-K by cosine
+    (live: provider ``similar_turns``; shadow: leave-one-out top-K), so a
+    filtered-out neighbor consumes a K slot exactly as it does live."""
+    kept = [n for n in raw
+            if passes_filter(n, query_source=query_source, min_similarity=min_similarity)]
+    if len(kept) < min_neighbors:
+        return None, len(kept)
+    verdict = decide(kept, now=now, hard_vote_threshold=hard_vote_threshold,
+                     halflife_s=halflife_s)
+    return verdict, len(kept)
 
 
 def tally(neighbors: Sequence[NeighborTurn], *, now: float,
@@ -178,14 +219,6 @@ class RetrievalResolver:
         return int((by_status.get("closed_final", 0) or 0)
                    + (by_status.get("closed_turn", 0) or 0))
 
-    def _keep(self, neighbor: NeighborTurn) -> bool:
-        """Confident enough, and not a synthetic vote leaking into organic."""
-        if float(neighbor.similarity) < self.min_similarity:
-            return False
-        if self.query_source == "organic" and neighbor.source == "simulator":
-            return False   # is_sim firewall
-        return True
-
     # ── the decision ─────────────────────────────────────────────────────────
 
     def resolve(self, text: str) -> Optional[RetrievalVerdict]:
@@ -216,15 +249,15 @@ class RetrievalResolver:
             return self._abstain("no embedding (embedder unavailable)",
                                  finalized_available=finalized)
         raw = self.memory.similar_turns(embedding, self.k)
-        kept = [n for n in raw if self._keep(n)]
-        if len(kept) < self.min_neighbors:
+        verdict, n_kept = evaluate_neighbors(
+            raw, now=self._now_fn(), query_source=self.query_source,
+            min_neighbors=self.min_neighbors, min_similarity=self.min_similarity,
+            hard_vote_threshold=self.hard_vote_threshold, halflife_s=self.halflife_s)
+        if verdict is None:
             return self._abstain(
-                f"only {len(kept)} confident neighbors (< {self.min_neighbors})",
-                n_raw=len(raw), n_kept=len(kept), finalized_available=finalized)
-        verdict = decide(kept, now=self._now_fn(),
-                         hard_vote_threshold=self.hard_vote_threshold,
-                         halflife_s=self.halflife_s)
+                f"only {n_kept} confident neighbors (< {self.min_neighbors})",
+                n_raw=len(raw), n_kept=n_kept, finalized_available=finalized)
         self.last = ResolveTrace(
             abstained=False, reason=verdict.reason, n_raw=len(raw),
-            n_kept=len(kept), finalized_available=finalized, verdict=verdict)
+            n_kept=n_kept, finalized_available=finalized, verdict=verdict)
         return verdict

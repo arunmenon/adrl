@@ -1,15 +1,15 @@
-"""WS3 — heuristic health: does each hand-written rule earn its keep?
+"""WS3 - heuristic health: does each hand-written rule earn its keep?
 
 The router's difficulty signal is a pile of hand-authored predicates: the verb
 lexicon (``features.VERB_CLASSES``), the scope modifiers, the terse-continuation
 guard, the big-context nudge, and the trajectory boosts (edit failures, recent
 errors, escalate-on-retry). They accreted by intuition. This module audits each
-one against recorded outcomes so none is trusted forever on faith — the direct
+one against recorded outcomes so none is trusted forever on faith - the direct
 answer to "these heuristics won't scale".
 
 HOW IT WORKS (read-only over the WS1 ledger):
 
-  * Every decision stores its full ``features_json`` — and ``extract()`` runs
+  * Every decision stores its full ``features_json`` - and ``extract()`` runs
     BEFORE the hard gates, so a rule's predicate is recorded on every turn even
     when a gate (context feasibility, privacy) actually made the routing call.
     That means we can measure a rule's *predictive power* on all turns where it
@@ -17,15 +17,20 @@ HOW IT WORKS (read-only over the WS1 ledger):
   * For each rule we compute ``hard_rate`` = P(turn went hard | rule fired) and
     compare it to the pool ``base_rate`` = P(turn went hard). The signed gap is
     the rule's **lift**.
-      - an EASY-leaning rule (trivial, explain, narrow scope, terse approval) is
-        pulling its weight when its hard_rate sits BELOW the base rate; if it is
-        at or above, the rule is anti-signal -> DEMOTE-CANDIDATE.
-      - a HARD-leaning rule (fix, refactor, broad scope, big context, the
-        trajectory boosts) earns its keep when its hard_rate is ABOVE the base
-        rate; at or below and it is over-routing -> DEMOTE-CANDIDATE.
-  * "went hard" is the shared weak proxy: an escalation fired, ``user_retried``,
-    or ``outcome_proxy_hard`` (router.outcomes). Only ``closed_*`` outcomes are
-    counted — a still-open turn has no verdict yet.
+      - an EASY-leaning rule (trivial, explain, narrow scope, terse approval)
+        pulls its weight when its hard_rate sits clearly BELOW the base rate;
+        clearly ABOVE and it is anti-signal -> DEMOTE-CANDIDATE.
+      - a HARD-leaning rule (broad scope, big context, the trajectory boosts)
+        earns its keep clearly ABOVE base; clearly BELOW and it is over-routing
+        -> DEMOTE-CANDIDATE.
+      - "clearly" means beyond WEAK_BAND (5%) of the base rate. Within the band
+        (including a rule exactly AT base) is WEAK-SIGNAL: no clear signal.
+      - leaning is judged by the policy's routing bands, so the middle-band verbs
+        (small_edit, write, fix, unknown) are NEUTRAL and only reported, never
+        flagged: the heuristic never routes them easy or hard in the first place.
+  * "went hard" is ``outcomes.went_hard``: an escalation fired, ``user_retried``,
+    or ``outcome_proxy_hard`` - the SAME label WS4 and the shadow harness use.
+    Only ``closed_*`` outcomes are counted; a still-open turn has no verdict yet.
 
 Demotion is a HUMAN decision in v1: this reporter only flags candidates (a rule
 firing rarely, or with the wrong-signed lift past a threshold on a large enough
@@ -52,12 +57,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from router.features import CONTEXT_TOKEN_THRESHOLD
+from router.outcomes import went_hard
+
 DEFAULT_DB_PATH = Path("data/router-memory.db")
 
-# A rule is worth flagging only when it has fired enough to trust the rate, and
-# when its lift crosses this magnitude in the wrong direction for its leaning.
+# A rule is worth flagging only when it has fired enough to trust the rate.
 MIN_SAMPLE = 20
-LIFT_TOLERANCE = 0.0  # wrong-signed lift beyond this (abs) past base rate -> flag
+# A lift within this band of the base rate (including exactly 0) is treated as no
+# clear signal -> WEAK-SIGNAL. Beyond the band, the sign vs the rule's leaning
+# decides OK (favored direction) or DEMOTE-CANDIDATE (wrong direction).
+WEAK_BAND = 0.05
 
 
 @dataclass
@@ -83,27 +93,34 @@ def _flag(field: str) -> Callable[[dict], bool]:
     return lambda features: bool(features.get(field))
 
 
-# The rule catalogue mirrors features.py / policy.py exactly. Every predicate the
-# live path can act on appears here so WS3 audits the whole surface — the process
-# fix for accretion: a new heuristic lands with its row here or it is invisible.
+# The rule catalogue mirrors features.py / policy.py. Every predicate the live
+# path can act on appears here so WS3 audits the whole surface (the process fix
+# for accretion: a new heuristic lands with its row here or it is invisible).
+#
+# `leaning` is judged against the policy's OWN routing bands (T_EASY=0.35 strict,
+# T_HARD=0.70): a verb is 'easy' only if its base score routes it local, 'hard'
+# only if it routes frontier, else 'neutral'. So small_edit (0.35, NOT < T_EASY)
+# and fix (0.55) are NEUTRAL: the heuristic sends them to the middle band, so
+# judging them by an easy/hard leaning the policy never implements would produce
+# a spurious demote verdict.
 RULES: list[Rule] = [
-    # verb lexicon (features.VERB_CLASSES), by base difficulty
-    Rule("verb:trivial", "easy", _verb_is("trivial")),
-    Rule("verb:explain", "easy", _verb_is("explain")),
-    Rule("verb:small_edit", "easy", _verb_is("small_edit")),
-    Rule("verb:write", "neutral", _verb_is("write")),
-    Rule("verb:fix", "hard", _verb_is("fix")),
-    Rule("verb:hard", "hard", _verb_is("hard")),
-    Rule("verb:unknown", "neutral", _verb_is("unknown")),
-    # scope modifiers
-    Rule("scope:broad", "hard", _flag("broad_scope")),
-    Rule("scope:narrow", "easy", _flag("narrow_scope")),
+    # verb lexicon (features.VERB_CLASSES), leaning by the band the score routes to
+    Rule("verb:trivial", "easy", _verb_is("trivial")),        # 0.10 -> local
+    Rule("verb:explain", "easy", _verb_is("explain")),        # 0.20 -> local
+    Rule("verb:small_edit", "neutral", _verb_is("small_edit")),  # 0.35 -> middle
+    Rule("verb:write", "neutral", _verb_is("write")),         # 0.45 -> middle
+    Rule("verb:fix", "neutral", _verb_is("fix")),             # 0.55 -> middle
+    Rule("verb:hard", "hard", _verb_is("hard")),              # 0.85 -> frontier
+    Rule("verb:unknown", "neutral", _verb_is("unknown")),     # 0.50 -> middle
+    # scope modifiers (push the score up/down)
+    Rule("scope:broad", "hard", _flag("broad_scope")),        # +0.20
+    Rule("scope:narrow", "easy", _flag("narrow_scope")),      # -0.10
     # the terse-approval guard (should stick to low-difficulty continuations)
     Rule("terse_continuation", "easy", _flag("is_terse_continuation")),
-    # context nudge (features.CONTEXT_TOKEN_THRESHOLD = 20k)
+    # context nudge: import the threshold so this can never drift from features.py
     Rule("context:big", "hard",
-         lambda features: (features.get("context_tokens") or 0) > 20_000),
-    # trajectory boosts (heuristic_score)
+         lambda features: (features.get("context_tokens") or 0) > CONTEXT_TOKEN_THRESHOLD),
+    # trajectory boosts (heuristic_score); each forces the score up
     Rule("traj:edit_failures", "hard",
          lambda features: (features.get("recent_edit_failures") or 0) >= 1),
     Rule("traj:recent_errors", "hard",
@@ -126,12 +143,6 @@ class RuleVerdict:
     note: str
 
 
-def _went_hard(escalated, user_retried, proxy_hard) -> bool:
-    """The shared weak 'this turn really was hard' proxy, from the outcome row.
-    Any escalation, an explicit user retry, or the friction proxy."""
-    return bool(escalated) or bool(user_retried) or bool(proxy_hard)
-
-
 def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
     """Return [(features_dict, went_hard)] over closed outcomes, honouring the
     optional source filter. Degrades to [] on any DB problem (never raises)."""
@@ -151,7 +162,7 @@ def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
             params = (source,)
         rows = conn.execute(query, params).fetchall()
     except sqlite3.OperationalError:
-        return []  # tables not created yet — uninitialized DB
+        return []  # tables not created yet - uninitialized DB
     except Exception:
         return []
     finally:
@@ -165,35 +176,41 @@ def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
                 features = {}
         except Exception:
             features = {}
-        pool.append((features, _went_hard(escalated, user_retried, proxy_hard)))
+        pool.append((features, went_hard(escalated, user_retried, proxy_hard)))
     return pool
 
 
 def _classify(rule: Rule, fired: int, hard_rate: float, base_rate: float,
               min_sample: int) -> tuple[str, str]:
-    """Turn a rule's measured lift into a verdict + one-line note."""
+    """Turn a rule's measured lift into a verdict + one-line note.
+
+    Bands (symmetric, single WEAK_BAND constant):
+      - fired < min_sample                     -> INSUFFICIENT (no verdict yet)
+      - neutral leaning                        -> OK (reported, never flagged)
+      - |lift| <= WEAK_BAND (incl. exactly 0)  -> WEAK-SIGNAL (no clear signal)
+      - beyond the band, favored direction     -> OK
+      - beyond the band, wrong direction       -> DEMOTE-CANDIDATE
+    'Favored direction' is negative lift for an easy rule (selects easier turns),
+    positive lift for a hard rule (selects harder turns)."""
     lift = hard_rate - base_rate
     if fired < min_sample:
-        return "INSUFFICIENT", f"only {fired} fires (< {min_sample}) — no verdict yet"
+        return "INSUFFICIENT", f"only {fired} fires (< {min_sample}) - no verdict yet"
     if rule.leaning == "neutral":
         return "OK", f"neutral rule, hard-rate {hard_rate:.0%} vs base {base_rate:.0%}"
+    if abs(lift) <= WEAK_BAND:
+        return "WEAK-SIGNAL", (
+            f"within {WEAK_BAND:.0%} of base (lift {lift:+.0%}) - no clear signal")
+    favored = lift < 0 if rule.leaning == "easy" else lift > 0
+    if favored:
+        direction = "easier" if rule.leaning == "easy" else "harder"
+        return "OK", f"selects {direction} turns (lift {lift:+.0%})"
     if rule.leaning == "easy":
-        # good = selects EASIER turns than the pool (lift below tolerance)
-        if lift <= LIFT_TOLERANCE - 1e-9:
-            return "OK", f"selects easier turns (lift {lift:+.0%})"
-        if lift <= 0.05:
-            return "WEAK-SIGNAL", f"barely below/at base (lift {lift:+.0%})"
         return "DEMOTE-CANDIDATE", (
-            f"easy-leaning but hard-rate {hard_rate:.0%} EXCEEDS base {base_rate:.0%} "
-            f"(lift {lift:+.0%}) — anti-signal")
-    # hard-leaning: good = selects HARDER turns than the pool (positive lift)
-    if lift >= -LIFT_TOLERANCE + 1e-9:
-        return "OK", f"selects harder turns (lift {lift:+.0%})"
-    if lift >= -0.05:
-        return "WEAK-SIGNAL", f"barely above/at base (lift {lift:+.0%})"
+            f"easy-leaning but hard-rate {hard_rate:.0%} exceeds base {base_rate:.0%} "
+            f"(lift {lift:+.0%}) - anti-signal")
     return "DEMOTE-CANDIDATE", (
-        f"hard-leaning but hard-rate {hard_rate:.0%} BELOW base {base_rate:.0%} "
-        f"(lift {lift:+.0%}) — over-routing")
+        f"hard-leaning but hard-rate {hard_rate:.0%} below base {base_rate:.0%} "
+        f"(lift {lift:+.0%}) - over-routing")
 
 
 def analyse(db_path: Path = DEFAULT_DB_PATH, *, source: Optional[str] = None,
@@ -244,14 +261,14 @@ def build(db_path: Path = DEFAULT_DB_PATH, *, source: Optional[str] = None,
     """Markdown rule-health report (pure)."""
     result = analyse(db_path, source=source, min_sample=min_sample)
     lines = [
-        "# rule health — do the hand-heuristics earn their keep?",
+        "# rule health - do the hand-heuristics earn their keep?",
         "",
         f"- db: `{db_path}`",
         f"- source pool: **{result['source']}**",
         f"- closed turns analysed: {result['total']}",
     ]
     if not result["total"]:
-        lines.append("- verdict: no closed outcomes yet (degraded/empty) — "
+        lines.append("- verdict: no closed outcomes yet (degraded/empty) - "
                      "run the flywheel or backfill first")
         return "\n".join(lines) + "\n"
     lines.append(
@@ -272,9 +289,9 @@ def build(db_path: Path = DEFAULT_DB_PATH, *, source: Optional[str] = None,
 
     flagged = [v for v in ranked if v.verdict == "DEMOTE-CANDIDATE"]
     if flagged:
-        lines.append("## demote candidates (human review — no auto-demote in v1)")
+        lines.append("## demote candidates (human review - no auto-demote in v1)")
         for v in flagged:
-            lines.append(f"- **{v.rule}** — {v.note}")
+            lines.append(f"- **{v.rule}** - {v.note}")
     else:
         lines.append("## demote candidates")
         lines.append("- none: every rule with a sufficient sample carries its "

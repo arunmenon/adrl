@@ -24,6 +24,13 @@ LOCAL_UPSTREAM="${LOCAL_UPSTREAM:-http://localhost:4001}"
 # (a user's own opt-in sessions); launch with DECISION_SOURCE=simulator when the
 # synthetic driver points here so sim fuel stays separable from the real pool.
 DECISION_SOURCE="${DECISION_SOURCE:-organic}"
+# Validate at the operator entry point: a typo'd source would silently label
+# rows into a cohort WS3/WS4 filters neither match nor error on.
+case "${DECISION_SOURCE}" in
+  organic|simulator) ;;
+  *) echo "DECISION_SOURCE must be 'organic' or 'simulator' (got '${DECISION_SOURCE}')" >&2
+     exit 1 ;;
+esac
 
 # Health-check the actual listening PORT, not just the pid. A wedged-but-alive
 # process (pid up, event loop hung) still holds the pid file and passes kill -0

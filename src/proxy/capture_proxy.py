@@ -549,7 +549,19 @@ async def make_app(capture_root: Path, route_utility: bool = False,
             from router.memory_facade import RouterMemory, RoutingRecorder
             from router.state import DictSessionStore
             try:
-                from router.llm_classifier import classify_intent_llm as classifier
+                # Route the classifier through the WS0 backend port so the
+                # config/backends.yaml classifier block actually controls its
+                # endpoint/model/timeout (previously classify_intent_llm was
+                # passed bare and always used its hardcoded /api/chat + 5s). If
+                # for_role yields no backend, classify_intent_llm(backend=None)
+                # falls back to that hardcoded path, so this only ever adds config
+                # authority, never a new failure mode.
+                from router.llm_classifier import classify_intent_llm
+                from router import backends as _backends
+                _classifier_backend = _backends.for_role("classifier")
+
+                def classifier(text):
+                    return classify_intent_llm(text, backend=_classifier_backend)
             except Exception:
                 classifier = None
             try:

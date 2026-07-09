@@ -26,3 +26,13 @@ def outcome_proxy_hard(row: dict) -> bool:
         or bool(row.get("interrupted"))
         or (row.get("n_continuations") or 0) >= 10
     )
+
+
+def went_hard(escalated, user_retried, proxy_hard) -> bool:
+    """The one 'this routed turn really went hard' label, from an outcome row's
+    three signals: an escalation fired, the user re-tried the turn, or the
+    friction proxy tripped. Single home (this module) so the retrieval vote
+    (WS4), the shadow ground truth, and rule health (WS3) all score by the SAME
+    definition rather than three subtly different copies. Any None counts False.
+    """
+    return bool(escalated) or bool(user_retried) or bool(proxy_hard)

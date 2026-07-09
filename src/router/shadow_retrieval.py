@@ -1,33 +1,42 @@
-"""WS4 shadow harness — would the retrieval router beat today's middle?
+"""WS4 shadow harness - would the retrieval router beat today's middle?
 
-Retrospective, read-only evaluation of ``retrieval_router`` over the ledger's
-ambiguous-middle decisions (``layer in {middle_default, classifier}``) — the
-only turns the retrieval layer would ever touch. For each such turn we ask the
-memory, using LEAVE-ONE-OUT, "how did turns like this one go?" and compare the
+Retrospective, read-only evaluation of the retrieval router over the ledger's
+ambiguous-middle decisions (``layer in {middle_default, classifier}``), the only
+turns the retrieval layer would ever touch. For each such turn it asks the
+memory, using LEAVE-ONE-OUT, "how did turns like this one go?" and compares the
 vote to what actually happened.
 
-  for each middle-band turn t with an embedding:
-    neighbors = cosine top-K over ALL OTHER closed turns
-                (exclude t and t's own session -> no leakage;
-                 similarity floor + is_sim firewall, same as live)
-    if too few confident neighbors -> ABSTAIN (t falls through to the classifier)
-    else -> decide() (the SAME vote the live resolver uses)
-    actual = did t really go hard? (escalated | user_retried | outcome_proxy_hard)
+Crucially it drives the REAL memory pipeline rather than a hand-rolled copy:
 
-The vote math is imported from ``retrieval_router`` (``decide``), never
-re-implemented, so shadow and live cannot drift.
+  * the neighbor set comes from ``SqliteProvider.similar_turns`` (the same
+    normalized-projection kNN the live resolver queries), so the blob decode,
+    normalization, and top-K-by-cosine ordering are shared, not re-implemented;
+  * leave-one-out drops the target and its own session from that ranked list,
+    then takes the top-K, so a filtered/firewalled neighbor consumes a K slot
+    exactly as it does live (live filters AFTER the top-K cut - the previous
+    hand-rolled walk filtered DURING the walk and evaluated turns live abstains
+    on);
+  * the filter, the neighbor-count gate, and the vote all run through
+    ``retrieval_router.evaluate_neighbors`` - the identical decision core the
+    live resolver uses;
+  * the global ``MIN_FINALIZED`` cold-start gate is enforced, so no metric is
+    reported for a memory regime where the live resolver abstains on everything;
+  * the ground-truth "went hard" label is ``outcomes.went_hard`` - the SAME
+    three-signal definition the neighbor vote now uses (NeighborTurn carries
+    user_retried), so the vote is never scored against a stricter label than it
+    votes on.
 
-GRADUATION GATE (plan): the retrieval layer is wired live only when, over at
-least ``GRADUATION_MIN_MIDDLE`` middle-band decisions, it beats BOTH the LLM
-classifier and the best-single-model baseline on a cost-aware objective, with
-frontier recall never below the classifier's. Until that many middle-band turns
-exist this report returns INSUFFICIENT DATA with the current confusion matrix as
-a *preview only* — never a spurious pass on a handful of rows.
+GRADUATION GATE (plan): the retrieval layer is wired live only when, over a
+sufficient number of ACTUALLY-EVALUATED (non-abstained) middle-band decisions,
+it beats both the LLM classifier and the best-single-model baseline on a
+cost-aware objective, with frontier recall never below the classifier's. The
+gate keys on ``evaluated``, not the raw middle count, so a run where almost
+everything abstains can never be declared sufficient.
 
-Known approximation: leave-one-out uses each turn's STORED document embedding as
-the query vector (the raw text is never stored, by design), so it skips the
-live ``search_query:`` prefix swap. Rankings are close; absolute numbers on a
-tiny sample are indicative, not final — another reason the gate needs volume.
+Known approximation: leave-one-out queries with each turn's STORED document
+embedding (the raw text is never stored, by design), skipping the live
+``search_query:`` prefix swap. Rankings are close; absolute numbers on a tiny
+sample are indicative, not final - another reason the gate needs volume.
 
 CLI:
     PYTHONPATH=src python -m router.shadow_retrieval --report [--db PATH]
@@ -41,16 +50,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-
-from router.memory_ports import NeighborTurn
+from router.memory_sqlite import SqliteProvider
+from router.outcomes import went_hard
 from router.retrieval_router import (
     GRADUATION_MIN_MIDDLE,
     K,
-    MIN_NEIGHBORS,
-    MIN_SIMILARITY,
-    RECENCY_HALFLIFE_S,
-    decide,
+    MIN_FINALIZED,
+    evaluate_neighbors,
 )
 
 DEFAULT_DB_PATH = Path("data/router-memory.db")
@@ -59,99 +65,45 @@ _CLOSED = ("closed_turn", "closed_final")
 
 
 @dataclass
-class _Row:
+class _Target:
+    """One middle-band decision to evaluate leave-one-out."""
+
     route_id: str
     session_id: str
-    layer: str
     source: str
-    ts: float
     escalated: bool
-    proxy_hard: Optional[bool]
     user_retried: Optional[bool]
-    rung: str
-    vector: np.ndarray          # L2-normalized
+    proxy_hard: Optional[bool]
+
+    @property
+    def actual_hard(self) -> bool:
+        return went_hard(self.escalated, self.user_retried, self.proxy_hard)
 
 
-def _went_hard(row: _Row) -> bool:
-    return bool(row.escalated) or bool(row.user_retried) or bool(row.proxy_hard)
-
-
-def _load(db_path: Path) -> list[_Row]:
-    """All closed decisions that carry an embedding, with normalized vectors.
-    Degrades to [] on any DB problem."""
+def _load_targets(conn: sqlite3.Connection) -> list[_Target]:
+    """Middle-band, closed decisions that carry an embedding. [] on any error."""
     try:
-        conn = sqlite3.connect(str(db_path))
-    except Exception:
-        return []
-    try:
-        raw = conn.execute(
-            "SELECT d.route_id, d.session_id, d.layer, d.source, d.ts, "
-            "o.escalated, o.outcome_proxy_hard, o.user_retried, d.rung, "
-            "e.dim, e.vec "
+        rows = conn.execute(
+            "SELECT d.route_id, d.session_id, d.source, "
+            "o.escalated, o.user_retried, o.outcome_proxy_hard "
             "FROM decisions d "
             "JOIN outcomes o ON o.route_id = d.route_id "
             "JOIN embeddings e ON e.route_id = d.route_id "
-            "WHERE o.status IN (?, ?)",
-            _CLOSED,
+            "WHERE o.status IN (?, ?) AND d.layer IN (?, ?)",
+            (*_CLOSED, *MIDDLE_LAYERS),
         ).fetchall()
     except sqlite3.OperationalError:
         return []
     except Exception:
         return []
-    finally:
-        conn.close()
-
-    rows: list[_Row] = []
-    dim0: Optional[int] = None
-    for (route_id, session_id, layer, source, ts, escalated, proxy_hard,
-         user_retried, rung, dim, blob) in raw:
-        if not isinstance(blob, (bytes, memoryview)) or len(blob) % 4 != 0:
-            continue
-        vector = np.frombuffer(blob, dtype="<f4")
-        if dim and vector.shape[0] != dim:
-            continue
-        if dim0 is None:
-            dim0 = vector.shape[0]
-        elif vector.shape[0] != dim0:
-            continue  # heterogeneous dim (embedder swap) — cannot compare
-        norm = float(np.linalg.norm(vector))
-        if norm == 0.0:
-            continue
-        rows.append(_Row(
-            route_id=route_id, session_id=session_id, layer=layer,
-            source=source, ts=float(ts or 0.0),
+    targets: list[_Target] = []
+    for route_id, session_id, source, escalated, user_retried, proxy_hard in rows:
+        targets.append(_Target(
+            route_id=route_id, session_id=session_id, source=source,
             escalated=bool(escalated),
-            proxy_hard=None if proxy_hard is None else bool(proxy_hard),
             user_retried=None if user_retried is None else bool(user_retried),
-            rung=rung, vector=vector / norm))
-    return rows
-
-
-def _neighbors_for(target: _Row, rows: list[_Row], matrix: np.ndarray,
-                   index: dict[str, int]) -> list[NeighborTurn]:
-    """Leave-one-out kNN: cosine of target against all rows, minus itself and
-    its own session, with the live similarity floor + is_sim firewall applied."""
-    sims = matrix @ target.vector
-    order = np.argsort(-sims)
-    kept: list[NeighborTurn] = []
-    for j in order:
-        other = rows[j]
-        if other.route_id == target.route_id:
-            continue
-        if other.session_id == target.session_id:
-            continue  # no same-session leakage
-        similarity = float(sims[j])
-        if similarity < MIN_SIMILARITY:
-            break  # sorted desc — nothing else qualifies
-        if target.source == "organic" and other.source == "simulator":
-            continue  # is_sim firewall
-        kept.append(NeighborTurn(
-            route_id=other.route_id, similarity=similarity, rung=other.rung,
-            escalated=other.escalated, outcome_proxy_hard=other.proxy_hard,
-            source=other.source, ts=other.ts))
-        if len(kept) >= K:
-            break
-    return kept
+            proxy_hard=None if proxy_hard is None else bool(proxy_hard)))
+    return targets
 
 
 @dataclass
@@ -164,6 +116,7 @@ class ShadowResult:
     fn: int
     tn: int
     now: float
+    finalized: int
 
     @property
     def coverage(self) -> float:
@@ -188,38 +141,65 @@ class ShadowResult:
 
 
 def evaluate(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) -> ShadowResult:
-    """Run the leave-one-out shadow evaluation. ``now`` is injectable so tests
-    are deterministic; defaults to the newest ledger ts (not wall-clock) so the
-    recency weighting is reproducible from the data alone."""
-    rows = _load(db_path)
-    if not rows:
-        return ShadowResult(0, 0, 0, 0, 0, 0, 0, now or 0.0)
-    if now is None:
-        now = max(r.ts for r in rows)
-    matrix = np.vstack([r.vector for r in rows])
-    index = {r.route_id: i for i, r in enumerate(rows)}
-    middle = [r for r in rows if r.layer in MIDDLE_LAYERS]
+    """Run the leave-one-out shadow evaluation against the real provider.
 
-    tp = fp = fn = tn = 0
-    evaluated = 0
-    for target in middle:
-        neighbors = _neighbors_for(target, rows, matrix, index)
-        if len(neighbors) < MIN_NEIGHBORS:
-            continue  # abstain
-        verdict = decide(neighbors, now=now)
-        evaluated += 1
-        actual_hard = _went_hard(target)
-        if verdict.needs_frontier and actual_hard:
-            tp += 1
-        elif verdict.needs_frontier and not actual_hard:
-            fp += 1
-        elif not verdict.needs_frontier and actual_hard:
-            fn += 1
-        else:
-            tn += 1
+    ``now`` is injectable for deterministic tests; it defaults to the newest
+    ledger ts (not wall-clock), so the recency weighting is reproducible from
+    the data alone."""
+    provider = SqliteProvider(db_path=db_path)
+    if not provider.health():
+        return ShadowResult(0, 0, 0, 0, 0, 0, 0, now or 0.0, 0)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        targets = _load_targets(conn)
+        if now is None:
+            row = conn.execute("SELECT MAX(ts) FROM decisions").fetchone()
+            now = float(row[0]) if row and row[0] is not None else 0.0
+        pool_size = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    finally:
+        conn.close()
+
+    stats = provider.stats()
+    by_status = stats.get("outcomes_by_status", {}) if isinstance(stats, dict) else {}
+    finalized = int((by_status.get("closed_final", 0) or 0)
+                    + (by_status.get("closed_turn", 0) or 0))
+
+    tp = fp = fn = tn = evaluated = 0
+    # Global cold-start gate: if the whole memory has too few finalized outcomes,
+    # the live resolver abstains on every query - so shadow must too, and report
+    # zero coverage rather than metrics for a silent regime.
+    if finalized >= MIN_FINALIZED and pool_size:
+        for target in targets:
+            embedding = provider.embedding_for(target.route_id)
+            if not embedding:
+                continue  # abstain (no vector)
+            # Full ranked list, then leave-one-out: drop the target and its own
+            # session BEFORE taking the top-K, so the K slots are the true
+            # neighbors live would see (the target itself is never in live memory
+            # when its turn is routed, and same-session turns are excluded here to
+            # prevent trajectory leakage into the evaluation).
+            ranked = provider.similar_turns(embedding, pool_size)
+            loo = [n for n in ranked
+                   if n.route_id != target.route_id
+                   and n.session_id != target.session_id]
+            top_k = loo[:K]
+            verdict, _ = evaluate_neighbors(top_k, now=now, query_source=target.source)
+            if verdict is None:
+                continue  # abstain
+            evaluated += 1
+            if verdict.needs_frontier and target.actual_hard:
+                tp += 1
+            elif verdict.needs_frontier and not target.actual_hard:
+                fp += 1
+            elif not verdict.needs_frontier and target.actual_hard:
+                fn += 1
+            else:
+                tn += 1
+
     return ShadowResult(
-        middle_total=len(middle), evaluated=evaluated,
-        abstained=len(middle) - evaluated, tp=tp, fp=fp, fn=fn, tn=tn, now=now)
+        middle_total=len(targets), evaluated=evaluated,
+        abstained=len(targets) - evaluated, tp=tp, fp=fp, fn=fn, tn=tn,
+        now=now, finalized=finalized)
 
 
 # ── reporter ───────────────────────────────────────────────────────────────
@@ -229,14 +209,17 @@ def build(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) -> st
     """Markdown graduation report (pure)."""
     result = evaluate(db_path, now=now)
     lines = [
-        "# retrieval router — shadow evaluation (WS4)",
+        "# retrieval router - shadow evaluation (WS4)",
         "",
         f"- db: `{db_path}`",
         f"- middle-band turns with embeddings: {result.middle_total}",
-        f"- graduation needs: >= {GRADUATION_MIN_MIDDLE} middle-band decisions",
+        f"- finalized outcomes in memory: {result.finalized} "
+        f"(cold-start gate: {MIN_FINALIZED})",
+        f"- graduation needs: >= {GRADUATION_MIN_MIDDLE} EVALUATED "
+        f"(non-abstained) middle-band decisions",
     ]
     if result.middle_total == 0:
-        lines.append("- verdict: **INSUFFICIENT DATA** — no middle-band turns "
+        lines.append("- verdict: **INSUFFICIENT DATA** - no middle-band turns "
                      "with embeddings yet (run the flywheel / backfill).")
         return "\n".join(lines) + "\n"
 
@@ -262,26 +245,27 @@ def build(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) -> st
             f"- actual hard-rate in this band: {result.actual_hard_rate:.0%}",
             "",
             "**Baselines on the same evaluated set** (cost-aware graduation target):",
-            f"- always-local: recall 0%, sends 0% to frontier "
-            f"(cheapest, misses every hard turn)",
-            f"- always-frontier: recall 100%, sends 100% to frontier "
-            f"(safest, most expensive)",
+            "- always-local: recall 0%, sends 0% to frontier "
+            "(cheapest, misses every hard turn)",
+            "- always-frontier: recall 100%, sends 100% to frontier "
+            "(safest, most expensive)",
             "- the retrieval router must beat always-local on accuracy WITHOUT "
             "dropping frontier recall below the LLM classifier's "
-            "(classifier verdicts not yet stamped in the ledger — that comparison "
+            "(classifier verdicts not yet stamped in the ledger; that comparison "
             "lands once classifier_tier is populated live).",
             "",
         ]
 
-    if result.middle_total < GRADUATION_MIN_MIDDLE:
-        need = GRADUATION_MIN_MIDDLE - result.middle_total
+    if result.evaluated < GRADUATION_MIN_MIDDLE:
+        need = GRADUATION_MIN_MIDDLE - result.evaluated
         lines.append(
-            f"## verdict: INSUFFICIENT DATA — {need} more middle-band decisions needed")
+            f"## verdict: INSUFFICIENT DATA - {need} more EVALUATED middle-band "
+            "decisions needed")
         lines.append(
             "The matrix above is a preview, not a graduation decision. Keep the "
-            "flywheel running; re-run this report as the middle band grows.")
+            "flywheel running; re-run this report as the evaluated set grows.")
     else:
-        lines.append("## verdict: SUFFICIENT SAMPLE — apply the graduation criteria")
+        lines.append("## verdict: SUFFICIENT SAMPLE - apply the graduation criteria")
         lines.append(
             f"Compare accuracy {result.accuracy:.0%} and recall "
             f"{result.frontier_recall:.0%} against the classifier + best-single "

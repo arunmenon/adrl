@@ -75,7 +75,14 @@ class OutcomeEvent:
 
 @dataclass
 class NeighborTurn:
-    """One kNN neighbor: a past decision + its (possibly still-open) outcome."""
+    """One kNN neighbor: a past decision + its (possibly still-open) outcome.
+
+    ``session_id`` and ``user_retried`` let a consumer reproduce the live
+    resolver exactly: session_id enables leave-one-out (exclude the querying
+    turn's own session) and per-session vote caps; user_retried gives the vote
+    the SAME three-signal hardness label the ground truth uses, so a shadow
+    evaluation can't score the vote against a stricter definition than it votes
+    on."""
 
     route_id: str = ""
     similarity: float = 0.0
@@ -84,6 +91,8 @@ class NeighborTurn:
     outcome_proxy_hard: Optional[bool] = None
     source: str = ""
     ts: float = 0.0
+    session_id: str = ""
+    user_retried: Optional[bool] = None
 
 
 class MemoryProvider(ABC):

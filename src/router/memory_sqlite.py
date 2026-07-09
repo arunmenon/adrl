@@ -113,6 +113,22 @@ def _as_nullable_bool(value: Optional[int]) -> Optional[bool]:
     return None if value is None else bool(value)
 
 
+def decode_embedding(blob, dim) -> Optional[np.ndarray]:
+    """Validate + decode a stored embedding BLOB into a float32 vector, or None.
+
+    The SINGLE decoder for the little-endian float32 storage format, shared by
+    the kNN projection and ``embedding_for`` (and consumers like the WS4 shadow
+    harness) so a reader can never disagree with the writer on endianness,
+    dtype, or length. Returns None (skip) rather than raising on a truncated or
+    dim-mismatched blob; a NULL/zero ``dim`` column skips the length check."""
+    if not isinstance(blob, (bytes, memoryview)) or len(blob) % 4 != 0:
+        return None
+    vector = np.frombuffer(blob, dtype="<f4")
+    if dim and vector.shape[0] != int(dim):
+        return None
+    return vector
+
+
 class SqliteProvider(_ProviderBase):
     """MemoryProvider backed by a local SQLite ledger + in-RAM kNN projection."""
 
@@ -320,7 +336,7 @@ class SqliteProvider(_ProviderBase):
         ledger (a projection per Engram ADR 0005 — always rebuildable)."""
         rows = self._conn.execute(
             "SELECT e.route_id, e.dim, e.vec, d.rung, d.source, d.ts, "
-            "o.escalated, o.outcome_proxy_hard "
+            "o.escalated, o.outcome_proxy_hard, d.session_id, o.user_retried "
             "FROM embeddings e "
             "JOIN decisions d ON d.route_id = e.route_id "
             "JOIN outcomes o ON o.route_id = e.route_id "
@@ -329,12 +345,11 @@ class SqliteProvider(_ProviderBase):
         ).fetchall()
         vectors: list[np.ndarray] = []
         metadata: list[dict] = []
-        for route_id, dim, blob, rung, source, ts, escalated, proxy_hard in rows:
-            if not isinstance(blob, (bytes, memoryview)) or len(blob) % 4 != 0:
-                continue  # truncated/corrupt blob — skip BEFORE frombuffer raises
-            vector = np.frombuffer(blob, dtype="<f4")
-            if dim and vector.shape[0] != dim:
-                continue  # malformed blob — skip, never raise
+        for (route_id, dim, blob, rung, source, ts, escalated, proxy_hard,
+             session_id, user_retried) in rows:
+            vector = decode_embedding(blob, dim)  # shared decoder; None on bad blob
+            if vector is None:
+                continue
             if vectors and vector.shape[0] != vectors[0].shape[0]:
                 continue  # heterogeneous dim (embedder swap) — can't join projection
             norm = float(np.linalg.norm(vector))
@@ -349,6 +364,8 @@ class SqliteProvider(_ProviderBase):
                     "outcome_proxy_hard": _as_nullable_bool(proxy_hard),
                     "source": source,
                     "ts": ts,
+                    "session_id": session_id,
+                    "user_retried": _as_nullable_bool(user_retried),
                 }
             )
         self._projection_matrix = np.vstack(vectors) if vectors else None
@@ -382,11 +399,31 @@ class SqliteProvider(_ProviderBase):
                     outcome_proxy_hard=self._projection_meta[i]["outcome_proxy_hard"],
                     source=self._projection_meta[i]["source"],
                     ts=self._projection_meta[i]["ts"],
+                    session_id=self._projection_meta[i]["session_id"],
+                    user_retried=self._projection_meta[i]["user_retried"],
                 )
                 for i in top
             ]
         except Exception:
             return []
+
+    def embedding_for(self, route_id: str) -> Optional[list[float]]:
+        """Return the stored (un-normalized) embedding for one route_id as a
+        list, or None if absent/degraded. Uses the shared ``decode_embedding``
+        so a caller never re-implements the blob format (WS4 shadow uses this to
+        drive similar_turns with a stored turn's own vector). Fail-safe."""
+        if self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT dim, vec FROM embeddings WHERE route_id = ?", (route_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            vector = decode_embedding(row[1], row[0])
+            return None if vector is None else vector.tolist()
+        except Exception:
+            return None
 
     # ── introspection ────────────────────────────────────────────────────
 

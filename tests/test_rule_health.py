@@ -56,11 +56,12 @@ def test_rule_predicates_fire():
 
 
 def test_went_hard_signal():
-    assert rule_health._went_hard(1, 0, 0)      # escalated
-    assert rule_health._went_hard(0, True, 0)   # user retried
-    assert rule_health._went_hard(0, 0, 1)      # proxy hard
-    assert not rule_health._went_hard(0, 0, 0)
-    assert not rule_health._went_hard(0, None, None)
+    # went_hard is the shared 3-signal label (outcomes.went_hard), imported here.
+    assert rule_health.went_hard(1, 0, 0)      # escalated
+    assert rule_health.went_hard(0, True, 0)   # user retried
+    assert rule_health.went_hard(0, 0, 1)      # proxy hard
+    assert not rule_health.went_hard(0, 0, 0)
+    assert not rule_health.went_hard(0, None, None)
 
 
 def test_base_rate_and_lift(tmp_path):
@@ -107,6 +108,54 @@ def test_hard_rule_over_routing_is_demote_candidate(tmp_path):
     broad = next(v for v in result["rules"] if v.rule == "scope:broad")
     assert broad.hard_rate < result["base_rate"]
     assert broad.verdict == "DEMOTE-CANDIDATE"
+
+
+def test_easy_rule_exactly_at_base_is_weak_signal(tmp_path):
+    db = tmp_path / "m.db"
+    # verb:trivial (easy) fires 20 with hard-rate exactly == base rate (lift 0).
+    # 20 trivial: 5 hard; 20 unknown: 5 hard -> base 25%, trivial 25% -> WEAK.
+    rows = [{"features": {"verb_class": "trivial"}, "hard": i < 5} for i in range(20)]
+    rows += [{"features": {"verb_class": "unknown"}, "hard": i < 5} for i in range(20)]
+    _seed(db, rows)
+    result = rule_health.analyse(db, min_sample=20)
+    trivial = next(v for v in result["rules"] if v.rule == "verb:trivial")
+    assert abs(trivial.lift) < 1e-9
+    assert trivial.verdict == "WEAK-SIGNAL"   # at base = no clear signal, not DEMOTE
+
+
+def test_easy_rule_just_beyond_band_is_demote(tmp_path):
+    db = tmp_path / "m.db"
+    # trivial fires 20 at 35% hard vs 25% base -> lift +10% (> WEAK_BAND) -> DEMOTE.
+    rows = [{"features": {"verb_class": "trivial"}, "hard": i < 7} for i in range(20)]
+    rows += [{"features": {"verb_class": "unknown"}, "hard": i < 3} for i in range(20)]
+    _seed(db, rows)
+    result = rule_health.analyse(db, min_sample=20)
+    trivial = next(v for v in result["rules"] if v.rule == "verb:trivial")
+    assert trivial.lift > rule_health.WEAK_BAND
+    assert trivial.verdict == "DEMOTE-CANDIDATE"
+
+
+def test_middle_band_verbs_are_neutral_never_demoted(tmp_path):
+    db = tmp_path / "m.db"
+    # verb:fix (0.55) and verb:small_edit (0.35) land in the policy MIDDLE band,
+    # so they are NEUTRAL: even a wildly off hard-rate must not flag DEMOTE.
+    rows = [{"features": {"verb_class": "fix"}, "hard": True} for _ in range(30)]
+    rows += [{"features": {"verb_class": "small_edit"}, "hard": False} for _ in range(30)]
+    _seed(db, rows)
+    result = rule_health.analyse(db, min_sample=20)
+    fix = next(v for v in result["rules"] if v.rule == "verb:fix")
+    small = next(v for v in result["rules"] if v.rule == "verb:small_edit")
+    assert fix.leaning == "neutral" and small.leaning == "neutral"
+    assert fix.verdict == "OK" and small.verdict == "OK"
+
+
+def test_context_big_uses_features_threshold(tmp_path):
+    # context:big must fire exactly at features.CONTEXT_TOKEN_THRESHOLD, not a
+    # hardcoded copy (guards against drift).
+    from router.features import CONTEXT_TOKEN_THRESHOLD
+    rule = next(r for r in rule_health.RULES if r.name == "context:big")
+    assert not rule.fired({"context_tokens": CONTEXT_TOKEN_THRESHOLD})       # not > threshold
+    assert rule.fired({"context_tokens": CONTEXT_TOKEN_THRESHOLD + 1})
 
 
 def test_insufficient_sample(tmp_path):
@@ -161,10 +210,15 @@ def test_build_markdown_smoke(tmp_path):
     assert "verb:explain" in report
 
 
-def test_json_payload_serializable(tmp_path):
+def test_json_payload_roundtrips_dynamic_fields(tmp_path):
     db = tmp_path / "m.db"
-    _seed(db, [{"features": {"verb_class": "fix"}, "hard": True} for _ in range(5)])
+    _seed(db, [{"features": {"verb_class": "fix"}, "hard": True} for _ in range(25)]
+          + [{"features": {"verb_class": "explain"}, "hard": False} for _ in range(25)])
     payload = rule_health._json_payload(db, None, 20)
-    # must round-trip through json (dataclasses converted to dicts)
-    json.dumps(payload)
-    assert payload["rules"][0]["rule"]
+    restored = json.loads(json.dumps(payload))   # full round-trip, not just dumps
+    assert restored["total"] == 50
+    fix = next(r for r in restored["rules"] if r["rule"] == "verb:fix")
+    # the dynamic computed fields (not a constant rule name) must survive asdict+json
+    assert fix["fired"] == 25
+    assert set(fix) >= {"fired", "fire_rate", "hard_rate", "lift", "verdict", "leaning"}
+    assert fix["verdict"] in ("OK", "WEAK-SIGNAL", "DEMOTE-CANDIDATE", "INSUFFICIENT")
