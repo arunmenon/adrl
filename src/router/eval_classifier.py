@@ -32,8 +32,6 @@ import json
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -154,24 +152,17 @@ def call_ollama(model: str, instruction: str, timeout: float) -> tuple[str | Non
         "options": {"temperature": 0, "num_predict": NUM_PREDICT},
         "keep_alive": 0,
     }
-    data = json.dumps(payload).encode()
-    request = urllib.request.Request(
-        OLLAMA_URL, data=data, method="POST",
-        headers={"content-type": "application/json"},
-    )
+    from router.backends import http_post_json  # shared transport (WS0)
+
     start = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode())
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        content = (body.get("message") or {}).get("content")
-        if not isinstance(content, str) or not content.strip():
-            return None, elapsed_ms, "empty content"
-        return content, elapsed_ms, None
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-            OSError, ValueError) as exc:
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return None, elapsed_ms, repr(exc)[:120]
+    body = http_post_json(OLLAMA_URL, payload, timeout)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    if body is None:
+        return None, elapsed_ms, "transport failure (connection/timeout/non-200)"
+    content = (body.get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None, elapsed_ms, "empty content"
+    return content, elapsed_ms, None
 
 
 def _percentile(values: list[float], pct: float) -> float | None:

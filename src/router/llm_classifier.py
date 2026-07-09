@@ -2,7 +2,9 @@
 
 A drop-in companion to the regex classifier in ``features.py``. It sends ONLY
 the isolated human instruction (never the surrounding context) to a small local
-model via ollama's ``/api/chat`` and asks for a one-line difficulty verdict.
+model — via the backend port (``backends.for_role("classifier")``; ollama by
+default, swappable to lattice / llama.cpp / MLX by config) — and asks for a
+one-line difficulty verdict.
 
 **Fail-safe is paramount.** This function sits on the live routing hot path.
 ANY failure — connection refused, timeout, non-200, empty or unparseable body,
@@ -93,18 +95,16 @@ def _build_payload(text: str, model: str) -> dict:
 def _http_post(endpoint: str, payload: dict, timeout: float) -> Optional[str]:
     """POST the payload and return the assistant message content, or None.
 
-    Any transport-level failure (refused connection, timeout, non-200, malformed
-    envelope, empty content) returns None rather than raising. Kept as a small,
-    monkeypatch-friendly seam so tests can inject responses without a live
-    ollama.
+    Delegates the transport to the shared ``backends.http_post_json`` (the one
+    HTTP implementation, WS0) and unwraps the ollama-native envelope. Kept as a
+    small, monkeypatch-friendly seam so tests can inject responses without a
+    live server.
     """
-    data = json.dumps(payload).encode()
-    request = urllib.request.Request(
-        endpoint, data=data, method="POST",
-        headers={"content-type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = json.loads(response.read().decode())
+    from router.backends import http_post_json
+
+    body = http_post_json(endpoint, payload, timeout)
+    if body is None:
+        return None
     content = (body.get("message") or {}).get("content")
     if not isinstance(content, str) or not content.strip():
         return None
@@ -173,6 +173,7 @@ def classify_intent_llm(
     model: str = DEFAULT_MODEL,
     timeout: float = DEFAULT_TIMEOUT,
     endpoint: str = DEFAULT_ENDPOINT,
+    backend: Optional[object] = None,
     _sender: Optional[Callable[[str, dict, float], Optional[str]]] = None,
 ) -> Optional[LlmVerdict]:
     """Classify one isolated instruction's difficulty via the local LLM.
@@ -181,12 +182,23 @@ def classify_intent_llm(
     is safe to call on the live routing hot path, and the caller falls back to
     the regex score whenever it returns None.
 
-    ``_sender`` is a test seam for injecting the HTTP transport; production
-    callers leave it unset and the module's urllib-based sender is used.
+    ``backend`` is the WS0 port path: pass any ``GenerationBackend`` (usually
+    ``backends.for_role("classifier")``) and the framework choice comes from
+    config, not code. The legacy ``endpoint``/``model`` kwargs keep the direct
+    ollama path working unchanged; ``_sender`` is a test seam for injecting the
+    HTTP transport.
     """
     try:
         if not text or not text.strip():
             return None
+        if backend is not None and _sender is None:
+            content = backend.chat(
+                [{"role": "system", "content": SYSTEM_PROMPT},
+                 {"role": "user", "content": text}],
+                {"temperature": 0, "num_predict": NUM_PREDICT,
+                 "keep_alive": KEEP_ALIVE},
+            )
+            return parse_verdict(content)
         sender = _sender or _http_post
         payload = _build_payload(text, model)
         content = sender(endpoint, payload, timeout)

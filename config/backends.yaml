@@ -1,0 +1,32 @@
+# Backend selection per router role (WS0). Code never imports a framework —
+# it asks backends.for_role(<role>) and gets whatever this file says.
+#
+# adapter: lattice | openai_compat | ollama
+#   lattice       — the in-house wrapper over serving frameworks (shim pending;
+#                   until wired it fail-safe-abstains, so put a fallback after it)
+#   openai_compat — /v1/chat/completions + /v1/embeddings: llama.cpp server,
+#                   mlx_lm.server, vLLM, ollama's /v1 — anything OpenAI-shaped
+#   ollama        — ollama-native /api/chat + /api/embed
+#
+# To move a role to llama.cpp or MLX: change its adapter to openai_compat and
+# point base_url at that server. No code change.
+
+classifier:
+  adapter: ollama
+  model: qwen2.5:3b-instruct
+  timeout: 5.0
+
+embedder:
+  adapter: ollama
+  model: nomic-embed-text        # pulled in WS1; ~270MB
+  timeout: 10.0
+
+local_small:
+  adapter: ollama
+  model: llama3.2:latest
+  timeout: 45.0
+
+local_code:
+  adapter: ollama
+  model: qwen2.5:7b-instruct-q4_K_M
+  timeout: 90.0
