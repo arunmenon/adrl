@@ -1,0 +1,317 @@
+"""WS3 — heuristic health: does each hand-written rule earn its keep?
+
+The router's difficulty signal is a pile of hand-authored predicates: the verb
+lexicon (``features.VERB_CLASSES``), the scope modifiers, the terse-continuation
+guard, the big-context nudge, and the trajectory boosts (edit failures, recent
+errors, escalate-on-retry). They accreted by intuition. This module audits each
+one against recorded outcomes so none is trusted forever on faith — the direct
+answer to "these heuristics won't scale".
+
+HOW IT WORKS (read-only over the WS1 ledger):
+
+  * Every decision stores its full ``features_json`` — and ``extract()`` runs
+    BEFORE the hard gates, so a rule's predicate is recorded on every turn even
+    when a gate (context feasibility, privacy) actually made the routing call.
+    That means we can measure a rule's *predictive power* on all turns where it
+    fired, not just the handful that reached the heuristic layer.
+  * For each rule we compute ``hard_rate`` = P(turn went hard | rule fired) and
+    compare it to the pool ``base_rate`` = P(turn went hard). The signed gap is
+    the rule's **lift**.
+      - an EASY-leaning rule (trivial, explain, narrow scope, terse approval) is
+        pulling its weight when its hard_rate sits BELOW the base rate; if it is
+        at or above, the rule is anti-signal -> DEMOTE-CANDIDATE.
+      - a HARD-leaning rule (fix, refactor, broad scope, big context, the
+        trajectory boosts) earns its keep when its hard_rate is ABOVE the base
+        rate; at or below and it is over-routing -> DEMOTE-CANDIDATE.
+  * "went hard" is the shared weak proxy: an escalation fired, ``user_retried``,
+    or ``outcome_proxy_hard`` (router.outcomes). Only ``closed_*`` outcomes are
+    counted — a still-open turn has no verdict yet.
+
+Demotion is a HUMAN decision in v1: this reporter only flags candidates (a rule
+firing rarely, or with the wrong-signed lift past a threshold on a large enough
+sample). Auto-demotion is a WS5 job once these verdicts are trusted.
+
+Provenance matters: synthetic (simulator) and organic outcomes are separable by
+``--source`` so synthetic friction never silently contaminates a verdict about
+real traffic. Default is every source, with the pool composition printed up top.
+
+Fail-safe: an uninitialized/locked DB yields an honest degraded report, never a
+crash (precedent: insights.py).
+
+CLI:
+    PYTHONPATH=src python -m router.rule_health --report [--db PATH] [--source organic]
+    PYTHONPATH=src python -m router.rule_health --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+DEFAULT_DB_PATH = Path("data/router-memory.db")
+
+# A rule is worth flagging only when it has fired enough to trust the rate, and
+# when its lift crosses this magnitude in the wrong direction for its leaning.
+MIN_SAMPLE = 20
+LIFT_TOLERANCE = 0.0  # wrong-signed lift beyond this (abs) past base rate -> flag
+
+
+@dataclass
+class Rule:
+    """A named predicate over the stored features dict, with a difficulty leaning.
+
+    ``leaning`` is the direction the rule pushes the difficulty score:
+    ``easy`` rules should select turns that go hard LESS than the base rate;
+    ``hard`` rules should select turns that go hard MORE than the base rate;
+    ``neutral`` rules make no strong claim (reported, never flagged).
+    """
+
+    name: str
+    leaning: str  # "easy" | "hard" | "neutral"
+    fired: Callable[[dict], bool]
+
+
+def _verb_is(verb_class: str) -> Callable[[dict], bool]:
+    return lambda features: features.get("verb_class") == verb_class
+
+
+def _flag(field: str) -> Callable[[dict], bool]:
+    return lambda features: bool(features.get(field))
+
+
+# The rule catalogue mirrors features.py / policy.py exactly. Every predicate the
+# live path can act on appears here so WS3 audits the whole surface — the process
+# fix for accretion: a new heuristic lands with its row here or it is invisible.
+RULES: list[Rule] = [
+    # verb lexicon (features.VERB_CLASSES), by base difficulty
+    Rule("verb:trivial", "easy", _verb_is("trivial")),
+    Rule("verb:explain", "easy", _verb_is("explain")),
+    Rule("verb:small_edit", "easy", _verb_is("small_edit")),
+    Rule("verb:write", "neutral", _verb_is("write")),
+    Rule("verb:fix", "hard", _verb_is("fix")),
+    Rule("verb:hard", "hard", _verb_is("hard")),
+    Rule("verb:unknown", "neutral", _verb_is("unknown")),
+    # scope modifiers
+    Rule("scope:broad", "hard", _flag("broad_scope")),
+    Rule("scope:narrow", "easy", _flag("narrow_scope")),
+    # the terse-approval guard (should stick to low-difficulty continuations)
+    Rule("terse_continuation", "easy", _flag("is_terse_continuation")),
+    # context nudge (features.CONTEXT_TOKEN_THRESHOLD = 20k)
+    Rule("context:big", "hard",
+         lambda features: (features.get("context_tokens") or 0) > 20_000),
+    # trajectory boosts (heuristic_score)
+    Rule("traj:edit_failures", "hard",
+         lambda features: (features.get("recent_edit_failures") or 0) >= 1),
+    Rule("traj:recent_errors", "hard",
+         lambda features: (features.get("recent_errors") or 0) >= 3),
+    Rule("retry_signal", "hard", _flag("prev_turn_interrupted")),
+]
+
+
+@dataclass
+class RuleVerdict:
+    """One rule's measured health over the analysed pool."""
+
+    rule: str
+    leaning: str
+    fired: int
+    fire_rate: float
+    hard_rate: float           # P(went hard | fired)
+    lift: float                # hard_rate - base_rate (signed)
+    verdict: str               # OK | WEAK-SIGNAL | DEMOTE-CANDIDATE | INSUFFICIENT
+    note: str
+
+
+def _went_hard(escalated, user_retried, proxy_hard) -> bool:
+    """The shared weak 'this turn really was hard' proxy, from the outcome row.
+    Any escalation, an explicit user retry, or the friction proxy."""
+    return bool(escalated) or bool(user_retried) or bool(proxy_hard)
+
+
+def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
+    """Return [(features_dict, went_hard)] over closed outcomes, honouring the
+    optional source filter. Degrades to [] on any DB problem (never raises)."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except Exception:
+        return []
+    try:
+        query = (
+            "SELECT d.features_json, o.escalated, o.user_retried, o.outcome_proxy_hard "
+            "FROM decisions d JOIN outcomes o ON o.route_id = d.route_id "
+            "WHERE o.status IN ('closed_turn', 'closed_final')"
+        )
+        params: tuple = ()
+        if source:
+            query += " AND d.source = ?"
+            params = (source,)
+        rows = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return []  # tables not created yet — uninitialized DB
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+    pool: list[tuple[dict, bool]] = []
+    for features_json, escalated, user_retried, proxy_hard in rows:
+        try:
+            features = json.loads(features_json) if features_json else {}
+            if not isinstance(features, dict):
+                features = {}
+        except Exception:
+            features = {}
+        pool.append((features, _went_hard(escalated, user_retried, proxy_hard)))
+    return pool
+
+
+def _classify(rule: Rule, fired: int, hard_rate: float, base_rate: float,
+              min_sample: int) -> tuple[str, str]:
+    """Turn a rule's measured lift into a verdict + one-line note."""
+    lift = hard_rate - base_rate
+    if fired < min_sample:
+        return "INSUFFICIENT", f"only {fired} fires (< {min_sample}) — no verdict yet"
+    if rule.leaning == "neutral":
+        return "OK", f"neutral rule, hard-rate {hard_rate:.0%} vs base {base_rate:.0%}"
+    if rule.leaning == "easy":
+        # good = selects EASIER turns than the pool (lift below tolerance)
+        if lift <= LIFT_TOLERANCE - 1e-9:
+            return "OK", f"selects easier turns (lift {lift:+.0%})"
+        if lift <= 0.05:
+            return "WEAK-SIGNAL", f"barely below/at base (lift {lift:+.0%})"
+        return "DEMOTE-CANDIDATE", (
+            f"easy-leaning but hard-rate {hard_rate:.0%} EXCEEDS base {base_rate:.0%} "
+            f"(lift {lift:+.0%}) — anti-signal")
+    # hard-leaning: good = selects HARDER turns than the pool (positive lift)
+    if lift >= -LIFT_TOLERANCE + 1e-9:
+        return "OK", f"selects harder turns (lift {lift:+.0%})"
+    if lift >= -0.05:
+        return "WEAK-SIGNAL", f"barely above/at base (lift {lift:+.0%})"
+    return "DEMOTE-CANDIDATE", (
+        f"hard-leaning but hard-rate {hard_rate:.0%} BELOW base {base_rate:.0%} "
+        f"(lift {lift:+.0%}) — over-routing")
+
+
+def analyse(db_path: Path = DEFAULT_DB_PATH, *, source: Optional[str] = None,
+            min_sample: int = MIN_SAMPLE) -> dict:
+    """Pure analysis: pool composition + a RuleVerdict per rule. No I/O beyond
+    the read. Returns {} shape with 'pool' and 'rules' keys."""
+    pool = _load_pool(db_path, source)
+    total = len(pool)
+    hard_total = sum(1 for _, hard in pool if hard)
+    base_rate = (hard_total / total) if total else 0.0
+
+    verdicts: list[RuleVerdict] = []
+    for rule in RULES:
+        fired_rows = [hard for features, hard in pool if _safe_fired(rule, features)]
+        fired = len(fired_rows)
+        hard_fired = sum(1 for hard in fired_rows if hard)
+        hard_rate = (hard_fired / fired) if fired else 0.0
+        verdict, note = _classify(rule, fired, hard_rate, base_rate, min_sample)
+        verdicts.append(RuleVerdict(
+            rule=rule.name, leaning=rule.leaning, fired=fired,
+            fire_rate=(fired / total) if total else 0.0,
+            hard_rate=hard_rate, lift=hard_rate - base_rate,
+            verdict=verdict, note=note))
+    return {
+        "source": source or "all",
+        "total": total,
+        "hard_total": hard_total,
+        "base_rate": base_rate,
+        "rules": verdicts,
+    }
+
+
+def _safe_fired(rule: Rule, features: dict) -> bool:
+    try:
+        return bool(rule.fired(features))
+    except Exception:
+        return False
+
+
+# ── reporter ───────────────────────────────────────────────────────────────
+
+
+_ORDER = {"DEMOTE-CANDIDATE": 0, "WEAK-SIGNAL": 1, "OK": 2, "INSUFFICIENT": 3}
+
+
+def build(db_path: Path = DEFAULT_DB_PATH, *, source: Optional[str] = None,
+          min_sample: int = MIN_SAMPLE) -> str:
+    """Markdown rule-health report (pure)."""
+    result = analyse(db_path, source=source, min_sample=min_sample)
+    lines = [
+        "# rule health — do the hand-heuristics earn their keep?",
+        "",
+        f"- db: `{db_path}`",
+        f"- source pool: **{result['source']}**",
+        f"- closed turns analysed: {result['total']}",
+    ]
+    if not result["total"]:
+        lines.append("- verdict: no closed outcomes yet (degraded/empty) — "
+                     "run the flywheel or backfill first")
+        return "\n".join(lines) + "\n"
+    lines.append(
+        f"- base hard-rate: {result['base_rate']:.1%} "
+        f"({result['hard_total']}/{result['total']} turns went hard)")
+    lines.append("")
+    lines.append("Lift = P(hard | rule fired) - base rate. Easy-leaning rules want "
+                 "negative lift; hard-leaning want positive.")
+    lines.append("")
+    lines.append("| rule | leaning | fired | fire% | hard-rate | lift | verdict |")
+    lines.append("|------|---------|------:|------:|----------:|-----:|---------|")
+    ranked = sorted(result["rules"], key=lambda v: (_ORDER.get(v.verdict, 9), -v.fired))
+    for v in ranked:
+        lines.append(
+            f"| {v.rule} | {v.leaning} | {v.fired} | {v.fire_rate:.1%} | "
+            f"{v.hard_rate:.0%} | {v.lift:+.0%} | {v.verdict} |")
+    lines.append("")
+
+    flagged = [v for v in ranked if v.verdict == "DEMOTE-CANDIDATE"]
+    if flagged:
+        lines.append("## demote candidates (human review — no auto-demote in v1)")
+        for v in flagged:
+            lines.append(f"- **{v.rule}** — {v.note}")
+    else:
+        lines.append("## demote candidates")
+        lines.append("- none: every rule with a sufficient sample carries its "
+                     "leaning's sign.")
+    insufficient = [v.rule for v in ranked if v.verdict == "INSUFFICIENT"]
+    if insufficient:
+        lines.append("")
+        lines.append(f"_Insufficient sample (< {min_sample} fires), no verdict yet: "
+                     f"{', '.join(insufficient)}._")
+    return "\n".join(lines) + "\n"
+
+
+def _json_payload(db_path: Path, source: Optional[str], min_sample: int) -> dict:
+    result = analyse(db_path, source=source, min_sample=min_sample)
+    result["rules"] = [asdict(v) for v in result["rules"]]
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="ledger path")
+    parser.add_argument("--source", default=None,
+                        choices=["organic", "simulator"],
+                        help="restrict the pool to one provenance (default: all)")
+    parser.add_argument("--min-sample", type=int, default=MIN_SAMPLE,
+                        help="minimum fires before a rule gets a verdict")
+    parser.add_argument("--report", action="store_true",
+                        help="print the markdown report (the default action)")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the analysis as JSON instead of markdown")
+    args = parser.parse_args()
+    if args.json:
+        print(json.dumps(_json_payload(args.db, args.source, args.min_sample),
+                         indent=2))
+    else:
+        print(build(args.db, source=args.source, min_sample=args.min_sample), end="")
+
+
+if __name__ == "__main__":
+    main()
