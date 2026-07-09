@@ -6,17 +6,20 @@
 # Chain:  simulator/harness -> capture proxy (:4000) -> litellm (:4001) -> ollama | anthropic
 
 model_list:
-  # --- local rung: ollama, OpenAI-compatible endpoint on :11434 ---
+  # --- local rung: ollama NATIVE provider (ollama_chat knows /api/chat + passes
+  #     tools through; the openai/ + /v1 shim 404s in this LiteLLM version) ---
   - model_name: local-code
     litellm_params:
-      model: openai/qwen2.5:7b-instruct-q4_K_M
-      api_base: http://localhost:11434/v1
-      api_key: "ollama"            # ollama ignores it but the client requires one
+      model: ollama_chat/qwen2.5:7b-instruct-q4_K_M
+      api_base: http://localhost:11434
+    model_info:
+      max_input_tokens: 32768      # so enable_pre_call_checks has a real ceiling
   - model_name: local-small
     litellm_params:
-      model: openai/llama3.2:latest
-      api_base: http://localhost:11434/v1
-      api_key: "ollama"
+      model: ollama_chat/llama3.2:latest
+      api_base: http://localhost:11434
+    model_info:
+      max_input_tokens: 32768
 
   # --- cloud rungs: Anthropic passthrough (key injected from env) ---
   - model_name: cheap-cloud
