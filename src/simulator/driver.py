@@ -38,7 +38,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-DRIVER_MODEL = "haiku"  # cheapest; the driver only writes one short message
+DRIVER_MODEL = "sonnet"  # the fake user: a stronger base voice before roughening
+                         # (one short message/turn, so the cost stays small)
 COMPLETION_MARKER = re.compile(
     r"\b(that'?s done|great,? now|perfect,? now|ok(ay)? now|nice,? now)\b", re.IGNORECASE
 )
