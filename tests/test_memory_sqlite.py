@@ -162,14 +162,19 @@ def test_duplicate_route_id_is_idempotent(provider):
 # ── lifecycle forward-only ───────────────────────────────────────────────────
 
 
-def test_lifecycle_forward_only(provider):
+def test_lifecycle_forward_and_same_rank(provider):
     provider.record_decision(make_decision("life"))
     assert provider.attach_outcome("life", make_outcome("closed_turn")) is True
-    # backwards and same-state transitions are rejected
+    # backward transitions rejected
     assert provider.attach_outcome("life", make_outcome("pending")) is False
-    assert provider.attach_outcome("life", make_outcome("closed_turn")) is False
+    # SAME-rank re-update on a non-terminal row is allowed (last-write-wins) so a
+    # turn's continuations can each refresh the working outcome (review finding)
+    assert provider.attach_outcome(
+        "life", make_outcome("closed_turn", escalated=True)) is True
     assert provider.attach_outcome("life", make_outcome("closed_final")) is True
+    # closed_final is terminal — no re-write, no backward
     assert provider.attach_outcome("life", make_outcome("closed_turn")) is False
+    assert provider.attach_outcome("life", make_outcome("closed_final")) is False
     assert provider.attach_outcome("life", make_outcome("bogus_status")) is False
     assert provider.stats()["outcomes_by_status"] == {"closed_final": 1}
 

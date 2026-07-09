@@ -183,6 +183,140 @@ async def acquire_upstream(attempts, send) -> AcquireResult:
     return AcquireResult(None, used_fallback, error, None)
 
 
+# ── WS2 routing mode helpers (pure; unit-tested in tests/test_router_proxy.py) ─
+# These only run when app["route_user_turns"] is True. The capture-only path
+# (:4000) never touches any of this — it is gated behind the flag in handle().
+
+
+def liveplan_attempts(live_router, plan, body: dict) -> list[tuple[str, bytes | None]]:
+    """Turn a ``router.live_router.RoutePlan`` into the ordered (upstream, body)
+    attempt list ``acquire_upstream`` consumes: the primary rung first, then the
+    Anthropic fail-open (present only for local rungs). Bodies are built with the
+    router's own model-rewrite helper, so a ``None`` model forwards the ORIGINAL
+    body unchanged (frontier / passthrough / the local fail-open)."""
+    attempts = [(
+        plan.primary_upstream,
+        live_router.build_forward_body(body, plan.primary_model),
+    )]
+    if plan.fallback_upstream is not None:
+        attempts.append((
+            plan.fallback_upstream,
+            live_router.build_forward_body(body, plan.fallback_model),
+        ))
+    return attempts
+
+
+def session_id_for(body: dict) -> str:
+    """The session key EXACTLY as ``LiveRouter`` computes it, so the escalation
+    controller and the memory recorder land on the same session the router
+    recorded under: ``discriminator.session_key`` first, else the router's
+    ``_fallback_sid``. Fail-safe to a constant so a bad body never breaks the
+    relay."""
+    try:
+        from router import discriminator
+        sid = discriminator.session_key(body)
+        if sid:
+            return sid
+    except Exception:
+        pass
+    try:
+        from router.live_router import _fallback_sid
+        return _fallback_sid(body)
+    except Exception:
+        return "anon:unknown"
+
+
+def last_user_content(body: dict):
+    """The content of the last user message — the inbound tool_results a
+    continuation carries, fed to the edit/no-progress/interrupt trip-wires."""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return message.get("content")
+    return None
+
+
+def reconstruct_blocks(raw: bytes) -> tuple[list[dict], int]:
+    """Reconstruct the assistant content blocks + output_tokens from a fully
+    accumulated ``/v1/messages`` response — an SSE stream OR a plain JSON body.
+    This is what the escalation controller observes. Fail-safe: any error yields
+    ``([], 0)`` (the trip-wires simply see nothing and never escalate)."""
+    if not raw:
+        return [], 0
+    text = raw.decode("utf-8", errors="replace")
+    stripped = text.lstrip()
+    if stripped.startswith("{"):                      # non-streaming JSON response
+        try:
+            payload = json.loads(stripped)
+            content = payload.get("content")
+            blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+            usage = payload.get("usage")
+            out = int(usage.get("output_tokens") or 0) if isinstance(usage, dict) else 0
+            return blocks, out
+        except Exception:
+            return [], 0
+    return _reconstruct_sse(text)
+
+
+def _reconstruct_sse(text: str) -> tuple[list[dict], int]:
+    """Rebuild content blocks from an Anthropic SSE stream. tool_use inputs are
+    assembled from their ``input_json_delta`` partials; if the accumulated JSON
+    is malformed (a local model emitting bad tool calls) the raw string is kept
+    as ``input`` so the parse_schema trip-wire sees a non-dict and strikes."""
+    blocks_by_index: dict[int, dict] = {}
+    json_buffers: dict[int, list[str]] = {}
+    output_tokens = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            evt = json.loads(payload)
+        except Exception:
+            continue
+        etype = evt.get("type")
+        if etype == "message_start":
+            usage = (evt.get("message") or {}).get("usage") or {}
+            output_tokens = max(output_tokens, int(usage.get("output_tokens") or 0))
+        elif etype == "content_block_start":
+            idx, cb = evt.get("index"), evt.get("content_block")
+            if isinstance(idx, int) and isinstance(cb, dict):
+                blocks_by_index[idx] = dict(cb)
+                json_buffers[idx] = []
+        elif etype == "content_block_delta":
+            idx = evt.get("index")
+            if not isinstance(idx, int):
+                continue
+            delta = evt.get("delta") or {}
+            dtype = delta.get("type")
+            if dtype == "text_delta":
+                blk = blocks_by_index.get(idx)
+                if blk is not None:
+                    blk["text"] = (blk.get("text") or "") + str(delta.get("text") or "")
+            elif dtype == "input_json_delta":
+                json_buffers.setdefault(idx, []).append(str(delta.get("partial_json") or ""))
+        elif etype == "message_delta":
+            usage = evt.get("usage") or {}
+            output_tokens = max(output_tokens, int(usage.get("output_tokens") or 0))
+    for idx, blk in blocks_by_index.items():
+        if blk.get("type") != "tool_use":
+            continue
+        raw_json = "".join(json_buffers.get(idx, []))
+        if raw_json.strip():
+            try:
+                blk["input"] = json.loads(raw_json)
+            except Exception:
+                blk["input"] = raw_json           # malformed -> parse trip-wire fires
+        elif "input" not in blk:
+            blk["input"] = {}
+    return [blocks_by_index[i] for i in sorted(blocks_by_index)], output_tokens
+
+
 async def handle(request: web.Request) -> web.StreamResponse:
     global _seq
     _seq += 1
@@ -198,23 +332,58 @@ async def handle(request: web.Request) -> web.StreamResponse:
     # captured bodies become binary). Identity is always acceptable to clients.
     fwd_headers["Accept-Encoding"] = "identity"
 
-    # ── P1-A live utility pinning (TRUE fail-open) ──────────────────────────
-    # Only when explicitly enabled AND the router hook fires. Rewrites utility
-    # housekeeping (titles, sidecar classifiers) to the local rung via LiteLLM;
-    # on any local failure the ORIGINAL Anthropic request is retried transparently.
-    # Everything else is byte-identical to the plain relay.
-    plan = plan_route(
-        request.method, str(request.rel_url), req_body,
-        route_utility=app["route_utility"],
-        anthropic_upstream=UPSTREAM,
-        local_upstream=app["local_upstream"],
-        hook_apply=_hook_apply,
-        log=lambda msg: print(f"[hook-error seq={seq}] {msg}"),
-    )
-    routed_label = plan.routed_label
+    # Capture-fields for the routing (WS2) path; None in capture-only mode.
+    routed_rung = route_layer = route_id = None
+    live_plan = None
+    parsed_body: dict = {}
+    session_id = None
 
+    if app["route_user_turns"]:
+        # ── WS2 LIVE routing: user_turn/continuation -> local/cheap/frontier ──
+        # A dedicated routing-proxy instance ONLY (flag-gated). The LiveRouter is
+        # the pure decision layer; acquire_upstream provides the SAME fail-open
+        # relay as P1-A (local failure -> ORIGINAL body -> Anthropic).
+        live_router = app["live_router"]
+        try:
+            parsed_body = json.loads(req_body) if req_body else {}
+            if not isinstance(parsed_body, dict):
+                parsed_body = {}
+        except Exception:
+            parsed_body = {}
+        live_plan = live_router.plan(request.method, str(request.rel_url), parsed_body)
+        routed_rung = live_plan.rung
+        route_layer = live_plan.layer
+        route_id = live_plan.route_id          # minted by the router's recorder
+        routed_label = None                    # P1-A field is N/A in routing mode
+        attempts = liveplan_attempts(live_router, live_plan, parsed_body)
+        session_id = session_id_for(parsed_body)
+        local_upstream = live_router.litellm_url
+        # A user turn starts a fresh trip-wire window (per-turn strike reset).
+        if live_plan.label == "user_turn":
+            try:
+                app["escalation"].new_turn(session_id)
+            except Exception:
+                pass
+    else:
+        # ── P1-A live utility pinning (TRUE fail-open) ──────────────────────
+        # Only when explicitly enabled AND the router hook fires. Rewrites utility
+        # housekeeping to the local rung via LiteLLM; on any local failure the
+        # ORIGINAL Anthropic request is retried transparently. Everything else is
+        # byte-identical to the plain capture relay.
+        plan = plan_route(
+            request.method, str(request.rel_url), req_body,
+            route_utility=app["route_utility"],
+            anthropic_upstream=UPSTREAM,
+            local_upstream=app["local_upstream"],
+            hook_apply=_hook_apply,
+            log=lambda msg: print(f"[hook-error seq={seq}] {msg}"),
+        )
+        routed_label = plan.routed_label
+        attempts = attempts_for(plan)
+        local_upstream = app["local_upstream"]
+
+    primary_body_for_capture = attempts[0][1]
     client: ClientSession = app["client"]
-    local_upstream = app["local_upstream"]
 
     async def _send(upstream_base: str, body: bytes | None):
         upstream_url = upstream_base + request.rel_url.raw_path
@@ -233,7 +402,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
             data=body if body else None, allow_redirects=False, **kwargs,
         )
 
-    result = await acquire_upstream(attempts_for(plan), _send)
+    result = await acquire_upstream(attempts, _send)
     local_fallback = result.used_fallback
     if local_fallback:
         print(f"[local-fallback seq={seq}] local rung failed -> Anthropic (original body)")
@@ -266,10 +435,60 @@ async def handle(request: web.Request) -> web.StreamResponse:
         if upstream_resp is not None:
             await upstream_resp.release()
 
+    # ── WS2 post-call: observe the outcome + record it to the flywheel ───────
+    # For a user_turn/continuation, reconstruct the assistant blocks from the
+    # bytes we already relayed, feed the escalation trip-wires (which may flip
+    # the session's sticky route for the NEXT request), and attach the outcome
+    # to the route_id the router minted. All wrapped — a recording failure never
+    # touches the response the client already has.
+    if (app["route_user_turns"] and live_plan is not None
+            and live_plan.label in ("user_turn", "continuation")):
+        latency_ms = (time.time() - started) * 1000.0
+        try:
+            blocks, out_tokens = reconstruct_blocks(b"".join(chunks))
+        except Exception:
+            blocks, out_tokens = [], 0
+        decision = None
+        try:
+            escalation = app["escalation"]
+            inbound = last_user_content(parsed_body)   # tool_results on a continuation
+            if inbound:
+                escalation.observe_tool_results(session_id, inbound)
+            decision = escalation.observe_response(
+                session_id, blocks, output_tokens=out_tokens)
+        except Exception:
+            decision = None
+        try:
+            outcome_cls = app["outcome_cls"]
+            if outcome_cls is not None:
+                # Derive `escalated` from the ACCUMULATED session state, not the
+                # single observation (review finding): once any continuation in
+                # this turn trips a wire, escalated_this_episode stays True, so a
+                # mid-turn escalation survives to the final outcome row. attach_
+                # outcome now allows same-rank last-write-wins, so each
+                # continuation refreshes the working row rather than being dropped.
+                try:
+                    accumulated = bool(app["escalation"].store.get_session(
+                        session_id).escalated_this_episode)
+                except Exception:
+                    accumulated = False
+                escalated = accumulated or bool(getattr(decision, "escalate", False))
+                outcome = outcome_cls(
+                    status="closed_turn",
+                    escalated=escalated,
+                    tripwire_name=getattr(decision, "tripwire", None),
+                    tripwire_type=getattr(decision, "tripwire_type", None),
+                    output_tokens=int(out_tokens),
+                    latency_ms=float(latency_ms),
+                )
+                app["recorder"].attach(session_id, outcome)
+        except Exception:
+            pass
+
     # Capture AFTER the client has its bytes — logging never delays the session.
     # request_body reflects what actually produced the response (rewritten body on
     # a local hit, ORIGINAL body when we fell open to Anthropic).
-    captured_body = result.sent_body if result.sent_body is not None else plan.primary_body
+    captured_body = result.sent_body if result.sent_body is not None else primary_body_for_capture
     try:
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -283,7 +502,10 @@ async def handle(request: web.Request) -> web.StreamResponse:
             "response_headers": _redacted(resp_headers) if status != 502 else {},
             "response_body": b"".join(chunks).decode("utf-8", errors="replace"),
             "routed_to_local": routed_label,   # P1-A: which utility label was pinned, or null
-            "local_fallback": local_fallback,  # P1-A: True iff local failed -> Anthropic fallback
+            "local_fallback": local_fallback,  # P1-A / WS2: True iff local failed -> Anthropic fallback
+            "routed_rung": routed_rung,        # WS2: rung the LiveRouter chose (null in capture-only)
+            "route_layer": route_layer,        # WS2: which policy layer decided
+            "route_id": route_id,              # WS2: memory route_id for this decision
         }
         out = _capture_dir(app["capture_root"]) / f"{int(started * 1000)}-{seq:06d}.json"
         out.write_text(json.dumps(record))
@@ -294,11 +516,61 @@ async def handle(request: web.Request) -> web.StreamResponse:
 
 
 async def make_app(capture_root: Path, route_utility: bool = False,
-                   local_upstream: str = "http://localhost:4001") -> web.Application:
+                   local_upstream: str = "http://localhost:4001",
+                   route_user_turns: bool = False,
+                   memory_db: str = "data/router-memory.db",
+                   live_router=None, escalation=None,
+                   recorder=None) -> web.Application:
+    """Build the proxy app. ``route_user_turns`` is the WS2 flag: OFF (default,
+    :4000) keeps every path byte-identical to the capture-only proxy and never
+    constructs any router live-decision object. ON (the dedicated routing-proxy
+    instance, :4002) wires ONE shared LiveRouter + EscalationController +
+    RoutingRecorder over ONE DictSessionStore. The live objects may be injected
+    (tests); otherwise they are built here from the real modules."""
     app = web.Application(client_max_size=256 * 1024 * 1024)
     app["capture_root"] = capture_root
     app["route_utility"] = route_utility     # P1-A live toggle (off by default)
     app["local_upstream"] = local_upstream
+    app["route_user_turns"] = route_user_turns  # WS2 live routing (off by default)
+    app["live_router"] = None
+    app["escalation"] = None
+    app["recorder"] = None
+    app["session_store"] = None
+    app["outcome_cls"] = None
+
+    if route_user_turns:
+        # Build (or accept injected) the ONE-per-process routing singletons. All
+        # three share ONE session store so the router's continuation-stickiness,
+        # the controller's escalation flips, and the memory recording agree.
+        if live_router is None or escalation is None or recorder is None:
+            from router.live_router import LiveRouter
+            from router.escalation_controller import EscalationController
+            from router.memory_facade import RouterMemory, RoutingRecorder
+            from router.state import DictSessionStore
+            try:
+                from router.llm_classifier import classify_intent_llm as classifier
+            except Exception:
+                classifier = None
+            try:
+                from router.memory_sqlite import SqliteProvider
+                from router.memory_null import NullProvider
+                providers = [SqliteProvider(Path(memory_db)), NullProvider()]
+            except Exception:
+                providers = None
+            store = DictSessionStore()
+            recorder = RoutingRecorder(RouterMemory(providers))
+            escalation = EscalationController(store)
+            live_router = LiveRouter(store=store, memory=recorder, classifier=classifier)
+            app["session_store"] = store
+        app["live_router"] = live_router
+        app["escalation"] = escalation
+        app["recorder"] = recorder
+        try:
+            from router.memory_ports import OutcomeEvent
+            app["outcome_cls"] = OutcomeEvent
+        except Exception:
+            app["outcome_cls"] = None
+
     app["client"] = ClientSession(
         connector=TCPConnector(limit=64),
         timeout=ClientTimeout(total=None, connect=30),  # streams run long — no total cap
@@ -324,17 +596,33 @@ def main() -> None:
                     help="P1-A LIVE: pin utility housekeeping to the local rung (fail-open)")
     ap.add_argument("--local-upstream", default="http://localhost:4001",
                     help="LiteLLM execution layer for local-routed utility calls")
+    ap.add_argument("--route-user-turns", action="store_true",
+                    help="WS2 LIVE: route user_turns/continuations across local/cheap/frontier "
+                         "with live escalation + outcome recording (dedicated routing-proxy)")
+    ap.add_argument("--memory-db", default="data/router-memory.db",
+                    help="WS2 routing-decision memory (SqliteProvider) path")
     args = ap.parse_args()
     UPSTREAM = args.upstream
     args.captures.mkdir(parents=True, exist_ok=True)
-    mode = "LIVE utility->local" if args.route_utility else "capture-only"
+    if args.route_user_turns:
+        mode = "LIVE route user_turns"
+    elif args.route_utility:
+        mode = "LIVE utility->local"
+    else:
+        mode = "capture-only"
     print(f"capture proxy :{args.port} -> {UPSTREAM}  [{mode}]  (captures -> {args.captures}/)")
-    if args.route_utility:
+    if args.route_utility and not args.route_user_turns:
         print(f"  utility housekeeping -> {args.local_upstream} (LiteLLM, cloud-fallback); "
               "kill switch: unset ANTHROPIC_BASE_URL or restart without --route-utility")
+    if args.route_user_turns:
+        print(f"  user_turns -> local rung on {args.local_upstream} (fail-open to Anthropic); "
+              f"cheap/frontier -> Anthropic; memory -> {args.memory_db}")
+        print("  kill switch: unset ANTHROPIC_BASE_URL or restart without --route-user-turns")
     print(f"use:  ANTHROPIC_BASE_URL=http://localhost:{args.port} claude")
     web.run_app(make_app(args.captures, route_utility=args.route_utility,
-                         local_upstream=args.local_upstream), port=args.port, print=None)
+                         local_upstream=args.local_upstream,
+                         route_user_turns=args.route_user_turns,
+                         memory_db=args.memory_db), port=args.port, print=None)
 
 
 if __name__ == "__main__":

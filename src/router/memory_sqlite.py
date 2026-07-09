@@ -216,8 +216,14 @@ class SqliteProvider(_ProviderBase):
             return None
 
     def attach_outcome(self, route_id: str, outcome: OutcomeEvent) -> bool:
-        """Overwrite the outcomes row with the event's fields; lifecycle moves
-        forward only (pending -> closed_turn -> closed_final)."""
+        """Overwrite the outcomes row with the event's fields.
+
+        Lifecycle: pending -> closed_turn -> closed_final. Forward or SAME-rank
+        updates on a non-terminal row are allowed (last-write-wins), so a turn's
+        successive continuations can each refresh the working outcome — e.g. a
+        mid-turn escalation that fires on a later continuation still lands on the
+        row (review finding). closed_final is terminal; backward transitions and
+        any re-write of a finalized row are rejected."""
         if self._conn is None:
             return False
         try:
@@ -230,8 +236,8 @@ class SqliteProvider(_ProviderBase):
             if row is None:
                 return False
             current_rank = _LIFECYCLE_RANK.get(row[0], 0)
-            if new_rank <= current_rank:
-                return False  # backwards or same-state transitions rejected
+            if row[0] == "closed_final" or new_rank < current_rank:
+                return False  # terminal, or a backward transition — rejected
             self._conn.execute(
                 "UPDATE outcomes SET status=?, escalated=?, tripwire_name=?, "
                 "tripwire_type=?, edit_failures=?, error_results=?, "
