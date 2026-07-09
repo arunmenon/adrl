@@ -212,6 +212,46 @@ def test_shadow_cold_start_gate_abstains(tmp_path):
     assert result.evaluated == 0        # cold-start gate, not neighbor scarcity
 
 
+def test_shadow_cold_start_excludes_target_from_finalized_count(tmp_path):
+    # Exactly MIN_FINALIZED finalized outcomes, the target being one of them. Each
+    # target excludes ITSELF (it was not in memory when routed live), so
+    # finalized-1 = 7 < 8 -> abstain, even with 7 confident neighbors that would
+    # otherwise vote. Pairs with the TP test (9 finalized -> evaluates) to pin the
+    # boundary. Guards the self-count inflation the completeness critic found.
+    db = tmp_path / "m.db"
+    rows = [{"vec": _A, "layer": "middle_default", "hard": True, "session": "t"}]
+    rows += [{"vec": _A, "layer": "heuristic", "hard": True, "session": f"n{i}"}
+             for i in range(7)]   # 8 finalized total, 7 confident neighbors
+    _seed(db, rows)
+    result = sr.evaluate(db, now=100.0)
+    assert result.finalized == 8
+    assert result.evaluated == 0        # finalized-1 = 7 < MIN_FINALIZED=8
+
+
+def test_shadow_top_k_then_filter_matches_live(tmp_path):
+    # F1 regression: live takes top-K by cosine THEN filters. Organic target with
+    # 12 SIMULATOR neighbors ranked ABOVE 6 organic neighbors (all above the 0.75
+    # floor). Correct top-K-then-filter fills the top-K=12 with the sims, which the
+    # firewall then drops -> abstain. The old filter-during-walk would skip the
+    # firewalled sims and reach the 6 organics -> wrongly evaluate. Needs >K
+    # neighbors to distinguish the two orderings.
+    db = tmp_path / "m.db"
+
+    def near(eps):        # cosine to _A decreases as eps grows; all stay > 0.75
+        return [1.0, eps, 0.0, 0.0]
+
+    rows = [{"vec": near(0.0), "layer": "middle_default", "hard": True,
+             "source": "organic", "session": "t"}]
+    rows += [{"vec": near(0.10 + 0.01 * i), "layer": "heuristic", "hard": True,
+              "source": "simulator", "session": f"s{i}"} for i in range(12)]
+    rows += [{"vec": near(0.60), "layer": "heuristic", "hard": True,
+              "source": "organic", "session": f"o{i}"} for i in range(6)]
+    _seed(db, rows)
+    result = sr.evaluate(db, now=100.0)
+    assert result.middle_total == 1
+    assert result.evaluated == 0        # top-12 are all firewalled sims
+
+
 def test_shadow_true_positive_on_hard_cluster(tmp_path):
     db = tmp_path / "m.db"
     # target + 8 hard cluster-A neighbors (distinct sessions) -> past cold-start,

@@ -41,19 +41,29 @@ port_answers() {
 }
 
 if [ -f data/router-proxy.pid ] && kill -0 "$(cat data/router-proxy.pid)" 2>/dev/null; then
-  if port_answers; then
-    echo "router proxy already running (pid $(cat data/router-proxy.pid)), port ${PORT} answering"
+  RUNNING_PID="$(cat data/router-proxy.pid)"
+  RUNNING_SOURCE="$(cat data/router-proxy.source 2>/dev/null || echo unknown)"
+  # Reuse ONLY when the live proxy is tagged with the SAME source requested.
+  # Reusing a proxy tagged differently (e.g. an organic :4002 while the flywheel
+  # asks for simulator) would silently mis-record decisions under the wrong
+  # provenance - the exact hazard the source tag exists to prevent - so a
+  # mismatch recycles instead of short-circuiting.
+  if port_answers && [ "${RUNNING_SOURCE}" = "${DECISION_SOURCE}" ]; then
+    echo "router proxy already running (pid ${RUNNING_PID}), port ${PORT} answering, source ${RUNNING_SOURCE}"
     exit 0
   fi
-  STALE_PID="$(cat data/router-proxy.pid)"
-  echo "router proxy pid ${STALE_PID} alive but port ${PORT} not answering — recycling" >&2
-  kill "${STALE_PID}" 2>/dev/null || true
+  if port_answers; then
+    echo "proxy on ${PORT} is source='${RUNNING_SOURCE}' but '${DECISION_SOURCE}' requested - recycling" >&2
+  else
+    echo "router proxy pid ${RUNNING_PID} alive but port ${PORT} not answering - recycling" >&2
+  fi
+  kill "${RUNNING_PID}" 2>/dev/null || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    kill -0 "${STALE_PID}" 2>/dev/null || break
+    kill -0 "${RUNNING_PID}" 2>/dev/null || break
     sleep 0.3
   done
-  kill -9 "${STALE_PID}" 2>/dev/null || true
-  rm -f data/router-proxy.pid
+  kill -9 "${RUNNING_PID}" 2>/dev/null || true
+  rm -f data/router-proxy.pid data/router-proxy.source
 fi
 
 # Refuse to start in routing mode without the local execution stack answering.
@@ -71,6 +81,7 @@ PYTHONPATH=src nohup .venv/bin/python -m proxy.capture_proxy \
   --decision-source "${DECISION_SOURCE}" \
   > data/router-proxy.log 2>&1 &
 echo $! > data/router-proxy.pid
+echo "${DECISION_SOURCE}" > data/router-proxy.source   # for the reuse source-match check
 sleep 1
 if kill -0 "$(cat data/router-proxy.pid)" 2>/dev/null; then
   echo "router proxy running (pid $(cat data/router-proxy.pid)), log: data/router-proxy.log"

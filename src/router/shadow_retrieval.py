@@ -167,8 +167,14 @@ def evaluate(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) ->
     tp = fp = fn = tn = evaluated = 0
     # Global cold-start gate: if the whole memory has too few finalized outcomes,
     # the live resolver abstains on every query - so shadow must too, and report
-    # zero coverage rather than metrics for a silent regime.
-    if finalized >= MIN_FINALIZED and pool_size:
+    # zero coverage rather than metrics for a silent regime. Subtract 1 because
+    # each target's OWN finalized outcome is in the count but was NOT in memory
+    # when that turn was routed live (the leave-one-out invariant); without this
+    # a target that is itself the MIN_FINALIZED-th outcome would be evaluated
+    # here though live would have cold-started on it. (This still over-counts
+    # outcomes finalized AFTER the target - an inherent limit of retrospective
+    # evaluation - but never counts the target against itself.)
+    if (finalized - 1) >= MIN_FINALIZED and pool_size:
         for target in targets:
             embedding = provider.embedding_for(target.route_id)
             if not embedding:
