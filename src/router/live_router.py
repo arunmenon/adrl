@@ -201,7 +201,8 @@ class LiveRouter:
                  memory: Any = None, classifier: Any = None,
                  litellm_url: str = DEFAULT_LITELLM_URL,
                  anthropic_url: str = DEFAULT_ANTHROPIC_URL,
-                 policy_version: str = "v1"):
+                 policy_version: str = "v1",
+                 source: str = "organic"):
         # store: the SessionStore shared with the escalation controller (so the
         # sticky route the controller flips is the same one continuations read).
         self.store: SessionStore = store or DictSessionStore()
@@ -210,6 +211,12 @@ class LiveRouter:
         self.litellm_url = litellm_url
         self.anthropic_url = anthropic_url
         self.policy_version = policy_version
+        # Instance-level provenance stamped on every recorded decision. A routing
+        # instance carries ONE traffic kind: 'simulator' when the synthetic driver
+        # points at it (fuel), 'organic' for a user's own opt-in sessions. Keeping
+        # them separable is what lets WS4 firewall synthetic votes out of the
+        # organic pool and WS3 avoid mixing synthetic outcomes into rule health.
+        self.source = source
 
     # ── dispatch primitives ──────────────────────────────────────────────────
 
@@ -338,6 +345,7 @@ class LiveRouter:
                 route_id = self.memory.record(
                     instruction_text, features, route, session_id=session_id,
                     turn_index=session.turn_count, decision_ms=decision_ms,
+                    source=self.source,
                 )
                 plan.route_id = route_id
             except Exception:

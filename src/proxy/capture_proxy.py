@@ -519,6 +519,7 @@ async def make_app(capture_root: Path, route_utility: bool = False,
                    local_upstream: str = "http://localhost:4001",
                    route_user_turns: bool = False,
                    memory_db: str = "data/router-memory.db",
+                   decision_source: str = "organic",
                    live_router=None, escalation=None,
                    recorder=None) -> web.Application:
     """Build the proxy app. ``route_user_turns`` is the WS2 flag: OFF (default,
@@ -560,7 +561,8 @@ async def make_app(capture_root: Path, route_utility: bool = False,
             store = DictSessionStore()
             recorder = RoutingRecorder(RouterMemory(providers))
             escalation = EscalationController(store)
-            live_router = LiveRouter(store=store, memory=recorder, classifier=classifier)
+            live_router = LiveRouter(store=store, memory=recorder,
+                                     classifier=classifier, source=decision_source)
             app["session_store"] = store
         app["live_router"] = live_router
         app["escalation"] = escalation
@@ -601,6 +603,11 @@ def main() -> None:
                          "with live escalation + outcome recording (dedicated routing-proxy)")
     ap.add_argument("--memory-db", default="data/router-memory.db",
                     help="WS2 routing-decision memory (SqliteProvider) path")
+    ap.add_argument("--decision-source", default="organic",
+                    choices=["organic", "simulator"],
+                    help="provenance stamped on every recorded decision from this "
+                         "instance: 'simulator' when the synthetic driver points here "
+                         "(fuel), 'organic' for a user's own opt-in sessions")
     args = ap.parse_args()
     UPSTREAM = args.upstream
     args.captures.mkdir(parents=True, exist_ok=True)
@@ -622,7 +629,9 @@ def main() -> None:
     web.run_app(make_app(args.captures, route_utility=args.route_utility,
                          local_upstream=args.local_upstream,
                          route_user_turns=args.route_user_turns,
-                         memory_db=args.memory_db), port=args.port, print=None)
+                         memory_db=args.memory_db,
+                         decision_source=args.decision_source),
+                port=args.port, print=None)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,10 @@ PORT="${PORT:-4002}"
 CAPTURES="${CAPTURES:-data/captures-routed}"
 MEMORY_DB="${MEMORY_DB:-data/router-memory.db}"
 LOCAL_UPSTREAM="${LOCAL_UPSTREAM:-http://localhost:4001}"
+# Provenance stamped on every decision this instance records. Default 'organic'
+# (a user's own opt-in sessions); launch with DECISION_SOURCE=simulator when the
+# synthetic driver points here so sim fuel stays separable from the real pool.
+DECISION_SOURCE="${DECISION_SOURCE:-organic}"
 
 # Health-check the actual listening PORT, not just the pid. A wedged-but-alive
 # process (pid up, event loop hung) still holds the pid file and passes kill -0
@@ -53,9 +57,11 @@ fi
 
 mkdir -p data "${CAPTURES}"
 echo "LIVE user-turn routing ENABLED (user_turns -> local rung, fail-open to Anthropic)"
+echo "decision provenance: ${DECISION_SOURCE}"
 PYTHONPATH=src nohup .venv/bin/python -m proxy.capture_proxy \
   --port "${PORT}" --captures "${CAPTURES}" \
   --route-user-turns --local-upstream "${LOCAL_UPSTREAM}" --memory-db "${MEMORY_DB}" \
+  --decision-source "${DECISION_SOURCE}" \
   > data/router-proxy.log 2>&1 &
 echo $! > data/router-proxy.pid
 sleep 1

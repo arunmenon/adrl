@@ -11,15 +11,19 @@
 # To move a role to llama.cpp or MLX: change its adapter to openai_compat and
 # point base_url at that server. No code change.
 
+# Testing default (user decision): the OpenAI-compat protocol — the same
+# interface llama.cpp / mlx_lm.server speak — served today by ollama's /v1.
 classifier:
-  adapter: ollama
+  adapter: openai_compat
   model: qwen2.5:3b-instruct
-  timeout: 5.0
+  base_url: http://localhost:11434
+  timeout: 30.0
 
 embedder:
-  adapter: ollama
-  model: nomic-embed-text        # pulled in WS1; ~270MB
-  timeout: 10.0
+  adapter: openai_compat
+  model: nomic-embed-text        # ~270MB local embedding model
+  base_url: http://localhost:11434
+  timeout: 15.0
 
 local_small:
   adapter: ollama
