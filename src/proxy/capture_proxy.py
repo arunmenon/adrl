@@ -44,6 +44,12 @@ except Exception:  # pragma: no cover
     def _hook_apply(method, path, body):  # type: ignore
         return body, None
 
+try:
+    from router.outcomes import outcome_proxy_hard
+except Exception:  # pragma: no cover
+    def outcome_proxy_hard(row):  # type: ignore
+        return False
+
 UPSTREAM = os.environ.get("CAPTURE_UPSTREAM", "https://api.anthropic.com")
 REDACT_HEADERS = {"authorization", "x-api-key", "cookie", "set-cookie"}
 # Hop-by-hop headers must not be forwarded either direction.
@@ -473,13 +479,37 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 except Exception:
                     accumulated = False
                 escalated = accumulated or bool(getattr(decision, "escalate", False))
+                # Populate the execution-friction signals so the outcome's
+                # derived `outcome_proxy_hard` is actually set (review finding: it
+                # was left None, so went_hard ignored friction and a turn that hit
+                # errored tool results but never escalated was mislabeled easy).
+                # The per-turn trip-wire strikes ({edit, parse, loop, noprog}) are
+                # accumulated by the observe_* calls above and reset each new turn.
+                try:
+                    strikes = app["escalation"].store.get_session(
+                        session_id).strikes or {}
+                except Exception:
+                    strikes = {}
+                edit_failures = int(strikes.get("edit", 0) or 0)
+                error_results = int(strikes.get("parse", 0) or 0)  # errored/malformed tool wire
+                interrupted = getattr(decision, "tripwire", None) == "user_interrupt"
+                proxy_hard = outcome_proxy_hard({
+                    "n_edit_failures": edit_failures,
+                    "n_error_results": error_results,
+                    "interrupted": interrupted,
+                    "n_continuations": 0,  # per-turn continuation count not at this seam
+                })
                 outcome = outcome_cls(
                     status="closed_turn",
                     escalated=escalated,
                     tripwire_name=getattr(decision, "tripwire", None),
                     tripwire_type=getattr(decision, "tripwire_type", None),
+                    edit_failures=edit_failures,
+                    error_results=error_results,
+                    interrupted=bool(interrupted),
                     output_tokens=int(out_tokens),
                     latency_ms=float(latency_ms),
+                    outcome_proxy_hard=proxy_hard,
                 )
                 app["recorder"].attach(session_id, outcome)
         except Exception:

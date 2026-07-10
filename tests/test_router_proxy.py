@@ -500,3 +500,38 @@ def test_routed_continuation_does_not_open_a_new_turn(tmp_path: Path):
     assert spy_esc.new_turns == []                      # continuation: no new turn
     assert len(spy_esc.observed) == 1                   # but still observed + recorded
     assert len(spy_rec.attached) == 1
+
+
+def test_routed_outcome_populates_friction_proxy_hard(tmp_path: Path):
+    # A turn that accrued edit/parse strikes but did NOT escalate must still be
+    # recorded hard via outcome_proxy_hard (review finding: friction was dropped,
+    # so went_hard mislabeled such turns easy).
+    class _Store:
+        def get_session(self, sid):
+            return SimpleNamespace(escalated_this_episode=False,
+                                   strikes={"edit": 2, "parse": 1})
+
+    spy_esc = _SpyEscalation()
+    spy_esc.store = _Store()
+    spy_rec = _SpyRecorder()
+    plan = LiveRoutePlan(
+        primary_model="local-code", primary_upstream=LITELLM,
+        fallback_model=None, fallback_upstream=ANTHROPIC,
+        rung="local", label="user_turn", route_id="route-fr", layer="heuristic")
+
+    async def _go():
+        app = await make_app(
+            tmp_path, route_user_turns=True,
+            live_router=_FakeRouter(plan), escalation=spy_esc, recorder=spy_rec)
+        await app["client"].close()
+        app["client"] = _FakeClient([_SSE_TOOLUSE])
+        return await _drive(app, json.dumps(_user_turn_body("sess-fr")).encode())
+
+    status, _ = _run(_go())
+    assert status == 200
+    assert len(spy_rec.attached) == 1
+    _, outcome = spy_rec.attached[0]
+    assert outcome.edit_failures == 2
+    assert outcome.error_results == 1
+    assert outcome.escalated is False
+    assert outcome.outcome_proxy_hard is True   # friction -> hard even without escalation

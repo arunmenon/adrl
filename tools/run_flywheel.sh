@@ -35,6 +35,12 @@ echo "embedder OK (config/backends.yaml embedder answered)"
 # idempotent and refuses to start without the local execution stack (:4001).
 DECISION_SOURCE=simulator PORT="${PORT}" bash tools/run_router_proxy.sh
 
+# From here the :PORT proxy is tagged simulator and KEEPS RUNNING after this
+# script exits. Warn (on any exit) so a later organic session isn't silently
+# mis-tagged by reusing it. run_router_proxy.sh recycles on a source mismatch, so
+# relaunching it organic before organic use is enough - this is the reminder.
+trap 'echo >&2; echo "NOTE: routing proxy on :'"${PORT}"' is left tagged simulator. Relaunch it organic (tools/run_router_proxy.sh) BEFORE any organic session; a naive reuse would mis-tag real turns as simulator." >&2' EXIT
+
 # Run the simulator AGAINST that proxy. --proxy is pinned to the routing port
 # here (not the default :4000 capture-only proxy), so the pairing is guaranteed.
 echo "running ${RUNS} simulator episode(s) -> :${PORT} (source=simulator)"
