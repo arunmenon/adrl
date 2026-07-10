@@ -140,6 +140,25 @@ PYTHONPATH=src .venv/bin/python -m simulator.run_session --episode episode_bound
 Episodes: `episode_boundary` (S15a) `rephrase_retry` (S6) `same_for_other` (working-summary)
 `easy_then_hard` (hysteresis) `investigate_then_fix` (S4->S3) `work_then_commit` (3 turns).
 
+## The qwen-code study harness
+
+`src/qwen_harness/` — a working Python re-implementation of the
+[qwen-code](https://github.com/QwenLM/qwen-code) agent harness (pinned to
+v0.19.8), built to make the harness side of the routing problem transparent:
+the full agentic loop (turn events, tool scheduler with approval modes, chat
+compression, loop detection, next-speaker continuation, QWEN.md memory, the
+system prompt) in readable modules that each port one upstream TypeScript file.
+It speaks OpenAI-compatible chat completions, so it runs against the local
+LiteLLM/ollama rung — and through the capture proxy for wire study:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m qwen_harness "explain src/router" \
+  --base-url http://localhost:4001/v1 --model local-code
+```
+
+Guided tour: [docs/qwen-code-harness-study.md](docs/qwen-code-harness-study.md).
+Tests: `tests/test_qwen_harness_*.py` (35, incl. a full loop over a scripted SSE wire).
+
 ## The shadow router (workstream B7 — in progress)
 
 `src/router/` — the routing layer's decision components, built test-first against
