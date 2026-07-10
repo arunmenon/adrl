@@ -71,6 +71,7 @@ class _Target:
     route_id: str
     session_id: str
     source: str
+    ts: float
     escalated: bool
     user_retried: Optional[bool]
     proxy_hard: Optional[bool]
@@ -84,7 +85,7 @@ def _load_targets(conn: sqlite3.Connection) -> list[_Target]:
     """Middle-band, closed decisions that carry an embedding. [] on any error."""
     try:
         rows = conn.execute(
-            "SELECT d.route_id, d.session_id, d.source, "
+            "SELECT d.route_id, d.session_id, d.source, d.ts, "
             "o.escalated, o.user_retried, o.outcome_proxy_hard "
             "FROM decisions d "
             "JOIN outcomes o ON o.route_id = d.route_id "
@@ -97,9 +98,10 @@ def _load_targets(conn: sqlite3.Connection) -> list[_Target]:
     except Exception:
         return []
     targets: list[_Target] = []
-    for route_id, session_id, source, escalated, user_retried, proxy_hard in rows:
+    for route_id, session_id, source, ts, escalated, user_retried, proxy_hard in rows:
         targets.append(_Target(
             route_id=route_id, session_id=session_id, source=source,
+            ts=float(ts or 0.0),
             escalated=bool(escalated),
             user_retried=None if user_retried is None else bool(user_retried),
             proxy_hard=None if proxy_hard is None else bool(proxy_hard)))
@@ -155,7 +157,6 @@ def evaluate(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) ->
         if now is None:
             row = conn.execute("SELECT MAX(ts) FROM decisions").fetchone()
             now = float(row[0]) if row and row[0] is not None else 0.0
-        pool_size = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
     finally:
         conn.close()
 
@@ -165,42 +166,41 @@ def evaluate(db_path: Path = DEFAULT_DB_PATH, *, now: Optional[float] = None) ->
                     + (by_status.get("closed_turn", 0) or 0))
 
     tp = fp = fn = tn = evaluated = 0
-    # Global cold-start gate: if the whole memory has too few finalized outcomes,
-    # the live resolver abstains on every query - so shadow must too, and report
-    # zero coverage rather than metrics for a silent regime. Subtract 1 because
-    # each target's OWN finalized outcome is in the count but was NOT in memory
-    # when that turn was routed live (the leave-one-out invariant); without this
-    # a target that is itself the MIN_FINALIZED-th outcome would be evaluated
-    # here though live would have cold-started on it. (This still over-counts
-    # outcomes finalized AFTER the target - an inherent limit of retrospective
-    # evaluation - but never counts the target against itself.)
-    if (finalized - 1) >= MIN_FINALIZED and pool_size:
-        for target in targets:
-            embedding = provider.embedding_for(target.route_id)
-            if not embedding:
-                continue  # abstain (no vector)
-            # Full ranked list, then leave-one-out: drop the target and its own
-            # session BEFORE taking the top-K, so the K slots are the true
-            # neighbors live would see (the target itself is never in live memory
-            # when its turn is routed, and same-session turns are excluded here to
-            # prevent trajectory leakage into the evaluation).
-            ranked = provider.similar_turns(embedding, pool_size)
-            loo = [n for n in ranked
-                   if n.route_id != target.route_id
-                   and n.session_id != target.session_id]
-            top_k = loo[:K]
-            verdict, _ = evaluate_neighbors(top_k, now=now, query_source=target.source)
-            if verdict is None:
-                continue  # abstain
-            evaluated += 1
-            if verdict.needs_frontier and target.actual_hard:
-                tp += 1
-            elif verdict.needs_frontier and not target.actual_hard:
-                fp += 1
-            elif not verdict.needs_frontier and target.actual_hard:
-                fn += 1
-            else:
-                tn += 1
+    for target in targets:
+        embedding = provider.embedding_for(target.route_id)
+        if not embedding:
+            continue  # abstain (no vector)
+        # TEMPORAL leave-one-out: a neighbor is only eligible if it existed in
+        # memory when the target was routed live - i.e. its decision ts is
+        # strictly before the target's. This drops the target itself AND every
+        # FUTURE outcome (a target can no longer be scored using turns that came
+        # after it), while correctly KEEPING same-session PAST turns (those were
+        # genuinely in live memory - the trajectory signal the router uses).
+        # Approximated by decision ts; the outcome may close slightly later, but
+        # this is far more faithful than the old blanket same-session exclusion
+        # (which dropped legitimate history) or using future outcomes.
+        ranked = provider.similar_turns(embedding, None)   # full ranked pool
+        past = [n for n in ranked
+                if n.route_id != target.route_id and n.ts < target.ts]
+        # Cold-start gate, temporally correct: if too few outcomes existed BEFORE
+        # this turn, the live resolver would have cold-started, so shadow abstains.
+        if len(past) < MIN_FINALIZED:
+            continue
+        # Recency is measured as of the TARGET's routing time (its ts), so a
+        # neighbor's age matches what the live resolver would have seen.
+        verdict, _ = evaluate_neighbors(past, now=target.ts, k=K,
+                                        query_source=target.source)
+        if verdict is None:
+            continue  # abstain
+        evaluated += 1
+        if verdict.needs_frontier and target.actual_hard:
+            tp += 1
+        elif verdict.needs_frontier and not target.actual_hard:
+            fp += 1
+        elif not verdict.needs_frontier and target.actual_hard:
+            fn += 1
+        else:
+            tn += 1
 
     return ShadowResult(
         middle_total=len(targets), evaluated=evaluated,

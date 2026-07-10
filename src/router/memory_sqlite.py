@@ -377,8 +377,15 @@ class SqliteProvider(_ProviderBase):
         self._projection_matrix = np.vstack(vectors) if vectors else None
         self._projection_meta = metadata
 
-    def similar_turns(self, embedding: list[float], k: int = 12) -> list[NeighborTurn]:
-        """Cosine top-k over closed_* rows via the cached in-RAM projection."""
+    def similar_turns(self, embedding: list[float],
+                      k: Optional[int] = 12) -> list[NeighborTurn]:
+        """Cosine-ranked closed_* rows via the cached in-RAM projection.
+
+        ``k`` caps the result; ``k=None`` returns the FULL ranked pool. Callers
+        that must filter (firewall/floor/leave-one-out) BEFORE taking their top-K
+        pass ``None`` so a filtered-out neighbor cannot crowd a valid one out of a
+        pre-cut top-K (review finding: firewall-after-top-K starved organic
+        retrieval)."""
         if self._conn is None:
             return []
         try:
@@ -395,7 +402,8 @@ class SqliteProvider(_ProviderBase):
             if norm == 0.0:
                 return []
             similarities = self._projection_matrix @ (query / norm)
-            top = np.argsort(-similarities)[: max(0, int(k))]
+            order = np.argsort(-similarities)
+            top = order if k is None else order[: max(0, int(k))]
             return [
                 NeighborTurn(
                     route_id=self._projection_meta[i]["route_id"],

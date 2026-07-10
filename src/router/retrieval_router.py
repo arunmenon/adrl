@@ -117,23 +117,27 @@ def passes_filter(neighbor: NeighborTurn, *, query_source: str,
     return True
 
 
-def evaluate_neighbors(raw: Sequence[NeighborTurn], *, now: float,
+def evaluate_neighbors(raw: Sequence[NeighborTurn], *, now: float, k: int = K,
                        query_source: str = "organic",
                        min_neighbors: int = MIN_NEIGHBORS,
                        min_similarity: float = MIN_SIMILARITY,
                        hard_vote_threshold: float = HARD_VOTE_THRESHOLD,
                        halflife_s: float = RECENCY_HALFLIFE_S,
                        ) -> tuple[Optional[RetrievalVerdict], int]:
-    """Filter a TOP-K neighbor list (floor + firewall) then vote, or abstain.
+    """FILTER a cosine-ranked pool (floor + firewall), THEN take the top-K, then
+    vote - or abstain.
 
-    Returns ``(verdict | None, n_kept)``. This is the shared decision core the
-    live resolver AND the shadow harness both call, so the filter ordering, the
+    Returns ``(verdict | None, n_kept)``. The shared decision core the live
+    resolver AND the shadow harness both call, so the filter ordering, the
     neighbor-count gate, and the vote can never drift between evaluation and
-    production. The caller supplies ``raw`` ALREADY capped to top-K by cosine
-    (live: provider ``similar_turns``; shadow: leave-one-out top-K), so a
-    filtered-out neighbor consumes a K slot exactly as it does live."""
-    kept = [n for n in raw
-            if passes_filter(n, query_source=query_source, min_similarity=min_similarity)]
+    production. ``raw`` is the FULL cosine-descending pool (not a pre-cut top-K):
+    filtering BEFORE the top-K cut means a firewalled/below-floor neighbor never
+    consumes a K slot, so dense synthetic fuel can't crowd valid organic
+    neighbors out of the vote (review finding: firewall-after-top-K starved
+    organic retrieval)."""
+    eligible = [n for n in raw
+                if passes_filter(n, query_source=query_source, min_similarity=min_similarity)]
+    kept = eligible[:k]   # top-K of the ELIGIBLE neighbors (raw is cosine-desc)
     if len(kept) < min_neighbors:
         return None, len(kept)
     verdict = decide(kept, now=now, hard_vote_threshold=hard_vote_threshold,
@@ -248,9 +252,12 @@ class RetrievalResolver:
         if not embedding:
             return self._abstain("no embedding (embedder unavailable)",
                                  finalized_available=finalized)
-        raw = self.memory.similar_turns(embedding, self.k)
+        # Fetch the FULL ranked pool (k=None) so evaluate_neighbors filters
+        # BEFORE taking the top-K. Passing self.k here would pre-cut to K and let
+        # firewalled neighbors starve the vote (review finding).
+        raw = self.memory.similar_turns(embedding, None)
         verdict, n_kept = evaluate_neighbors(
-            raw, now=self._now_fn(), query_source=self.query_source,
+            raw, now=self._now_fn(), k=self.k, query_source=self.query_source,
             min_neighbors=self.min_neighbors, min_similarity=self.min_similarity,
             hard_vote_threshold=self.hard_vote_threshold, halflife_s=self.halflife_s)
         if verdict is None:
