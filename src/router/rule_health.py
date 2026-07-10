@@ -115,8 +115,11 @@ RULES: list[Rule] = [
     # scope modifiers (push the score up/down)
     Rule("scope:broad", "hard", _flag("broad_scope")),        # +0.20
     Rule("scope:narrow", "easy", _flag("narrow_scope")),      # -0.10
-    # the terse-approval guard (should stick to low-difficulty continuations)
-    Rule("terse_continuation", "easy", _flag("is_terse_continuation")),
+    # the terse-approval guard is STICKY, not easy: policy.py keeps the session's
+    # CURRENT route (which may be frontier), so it is neutral - judging it easy
+    # would spuriously DEMOTE it when "go ahead" follows a hard, frontier-stuck
+    # task (review finding).
+    Rule("terse_continuation", "neutral", _flag("is_terse_continuation")),
     # context nudge: import the threshold so this can never drift from features.py
     Rule("context:big", "hard",
          lambda features: (features.get("context_tokens") or 0) > CONTEXT_TOKEN_THRESHOLD),

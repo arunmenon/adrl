@@ -124,7 +124,13 @@ def decode_embedding(blob, dim) -> Optional[np.ndarray]:
     if not isinstance(blob, (bytes, memoryview)) or len(blob) % 4 != 0:
         return None
     vector = np.frombuffer(blob, dtype="<f4")
-    if dim and vector.shape[0] != int(dim):
+    try:
+        expected = int(dim) if dim else 0
+    except (TypeError, ValueError):
+        return None  # a non-numeric dim (SQLite accepts text) must SKIP this one
+                     # row, never raise - or one bad row would sink the whole
+                     # projection via similar_turns' outer except (review finding).
+    if expected and vector.shape[0] != expected:
         return None
     return vector
 

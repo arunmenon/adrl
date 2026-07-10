@@ -16,7 +16,7 @@ Lift = P(hard | rule fired) - base rate. Easy-leaning rules want negative lift; 
 | verb:explain | easy | 47 | 6.2% | 6% | -10% | OK |
 | verb:fix | neutral | 17 | 2.3% | 53% | +37% | INSUFFICIENT |
 | retry_signal | hard | 17 | 2.3% | 12% | -5% | INSUFFICIENT |
-| terse_continuation | easy | 11 | 1.5% | 27% | +11% | INSUFFICIENT |
+| terse_continuation | neutral | 11 | 1.5% | 27% | +11% | INSUFFICIENT |
 | verb:write | neutral | 8 | 1.1% | 12% | -4% | INSUFFICIENT |
 | scope:broad | hard | 8 | 1.1% | 12% | -4% | INSUFFICIENT |
 | traj:recent_errors | hard | 5 | 0.7% | 0% | -16% | INSUFFICIENT |

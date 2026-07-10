@@ -149,6 +149,21 @@ def test_middle_band_verbs_are_neutral_never_demoted(tmp_path):
     assert fix.verdict == "OK" and small.verdict == "OK"
 
 
+def test_terse_continuation_is_neutral_not_flagged(tmp_path):
+    # terse_continuation is sticky (keeps the current route, maybe frontier), so
+    # even firing on hard turns it must be neutral -> OK, never DEMOTE-CANDIDATE.
+    db = tmp_path / "m.db"
+    rows = [{"features": {"is_terse_continuation": True}, "hard": True}
+            for _ in range(30)]
+    rows += [{"features": {"verb_class": "explain"}, "hard": False}
+             for _ in range(30)]
+    _seed(db, rows)
+    result = rule_health.analyse(db, min_sample=20)
+    terse = next(v for v in result["rules"] if v.rule == "terse_continuation")
+    assert terse.leaning == "neutral"
+    assert terse.verdict == "OK"
+
+
 def test_context_big_uses_features_threshold(tmp_path):
     # context:big must fire exactly at features.CONTEXT_TOKEN_THRESHOLD, not a
     # hardcoded copy (guards against drift).

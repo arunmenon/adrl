@@ -40,6 +40,14 @@ port_answers() {
   curl -s -o /dev/null -m 4 "http://localhost:${PORT}/" >/dev/null 2>&1
 }
 
+# Refuse to start in routing mode without the local execution stack answering.
+# This runs BEFORE any reuse/recycle so a failed health check can never leave us
+# having killed a working proxy with nothing to replace it (review finding).
+if ! curl -s -o /dev/null -m 4 "${LOCAL_UPSTREAM}/health/liveliness" 2>/dev/null; then
+  echo "LiteLLM ${LOCAL_UPSTREAM} not answering - start tools/run_litellm.sh first" >&2
+  exit 1
+fi
+
 if [ -f data/router-proxy.pid ] && kill -0 "$(cat data/router-proxy.pid)" 2>/dev/null; then
   RUNNING_PID="$(cat data/router-proxy.pid)"
   RUNNING_SOURCE="$(cat data/router-proxy.source 2>/dev/null || echo unknown)"
@@ -64,12 +72,6 @@ if [ -f data/router-proxy.pid ] && kill -0 "$(cat data/router-proxy.pid)" 2>/dev
   done
   kill -9 "${RUNNING_PID}" 2>/dev/null || true
   rm -f data/router-proxy.pid data/router-proxy.source
-fi
-
-# Refuse to start in routing mode without the local execution stack answering.
-if ! curl -s -o /dev/null -m 4 "${LOCAL_UPSTREAM}/health/liveliness" 2>/dev/null; then
-  echo "LiteLLM ${LOCAL_UPSTREAM} not answering — start tools/run_litellm.sh first" >&2
-  exit 1
 fi
 
 mkdir -p data "${CAPTURES}"

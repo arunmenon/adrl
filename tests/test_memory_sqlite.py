@@ -119,6 +119,32 @@ def test_record_decision_round_trip(provider, tmp_path):
     connection.close()
 
 
+def test_bad_dim_row_does_not_sink_projection(provider):
+    # A valid closed decision with an embedding...
+    provider.record_decision(make_decision("good", ts=1.0),
+                             embedding=[1.0, 0.0, 0.0, 0.0])
+    provider.attach_outcome("good", make_outcome(status="closed_final"))
+    # ...plus a corrupt row whose dim column is NON-NUMERIC text (SQLite allows
+    # any type in an INTEGER column). int('bad-dim') used to raise and sink the
+    # entire projection via similar_turns' outer except (review finding).
+    conn = provider._conn
+    conn.execute(
+        "INSERT INTO decisions (route_id, ts, session_id, turn_index, source, "
+        "features_json, layer, rung) VALUES "
+        "('bad', 2.0, 's2', 0, 'simulator', '{}', 'heuristic', 'local')")
+    conn.execute(
+        "INSERT INTO outcomes (route_id, status, escalated) "
+        "VALUES ('bad', 'closed_final', 0)")
+    conn.execute(
+        "INSERT INTO embeddings (route_id, dim, vec) VALUES ('bad', 'bad-dim', ?)",
+        (np.asarray([1, 0, 0, 0], dtype="<f4").tobytes(),))
+    conn.commit()
+    neighbors = provider.similar_turns([1.0, 0.0, 0.0, 0.0], k=5)
+    ids = {n.route_id for n in neighbors}
+    assert "good" in ids        # the valid neighbor survives...
+    assert "bad" not in ids     # ...and the corrupt row is skipped, not fatal
+
+
 def test_record_without_embedding_stores_no_embedding_row(provider):
     provider.record_decision(make_decision("r-pinned"))
     stats = provider.stats()
