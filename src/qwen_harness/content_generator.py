@@ -209,6 +209,10 @@ class GeneratorConfig:
     stream_idle_timeout_s: float = DEFAULT_STREAM_IDLE_TIMEOUT_S
     max_retries: int = RETRY_MAX_ATTEMPTS
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # stream=False fetches one complete response and adapts it to the chunk
+    # interface — useful for local servers whose streaming tool-call support
+    # is unreliable (llama.cpp/ollama variants)
+    streaming: bool = True
 
 
 class ContentGenerator:
@@ -251,9 +255,12 @@ class ContentGenerator:
         body: dict[str, Any] = {
             "model": model,
             "messages": contents_to_openai_messages(contents, system_instruction),
-            "stream": True,
-            "stream_options": {"include_usage": True},
         }
+        if self.config.streaming:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
+        else:
+            body["stream"] = False
         if tools:
             body["tools"] = tools_to_openai(tools)  # never send tools: []
         if max_output_tokens:
@@ -261,12 +268,63 @@ class ContentGenerator:
         if temperature is not None:
             body["temperature"] = temperature
 
+        if not self.config.streaming:
+            for chunk in await self._with_backoff(lambda: self._complete_once(body)):
+                yield chunk
+            return
+
         async def attempt() -> list[ModelResponseChunk] | None:
             # First chunk decides retryability; after that we stream through.
             return await self._open_stream(body)
 
         async for chunk in await self._with_backoff(attempt):
             yield chunk
+
+    async def _complete_once(self, body: dict) -> list[ModelResponseChunk]:
+        """Non-streaming: one response, adapted to the chunk interface
+        (convertOpenAIResponseToGemini)."""
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout_s * 4)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            resp = await session.post(f"{self.config.base_url}/chat/completions",
+                                      json=body, headers=self._headers())
+            if resp.status in RETRYABLE_STATUS:
+                retry_after = resp.headers.get("Retry-After")
+                raise RetryableApiError(resp.status, (await resp.text())[:512],
+                                        float(retry_after) if retry_after else None)
+            if resp.status >= 400:
+                raise RuntimeError(
+                    f"[API Error: HTTP {resp.status}: {(await resp.text())[:512]}]")
+            payload = await resp.json()
+
+        chunks: list[ModelResponseChunk] = []
+        choice = (payload.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        if message.get("content") or message.get("reasoning_content"):
+            chunks.append(ModelResponseChunk(
+                text=message.get("content") or None,
+                thought=message.get("reasoning_content") or None))
+        calls = [FunctionCall(name=(tc.get("function") or {}).get("name")
+                              or "undefined_tool_name",
+                              args=_safe_json_parse(
+                                  (tc.get("function") or {}).get("arguments") or "{}"),
+                              id=tc.get("id") or new_call_id())
+                 for tc in message.get("tool_calls") or []]
+        usage = None
+        if u := payload.get("usage"):
+            usage = UsageMetadata(
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=u.get("completion_tokens", 0),
+                total_tokens=u.get("total_tokens", 0),
+                cached_tokens=(u.get("prompt_tokens_details") or {}).get(
+                    "cached_tokens", 0))
+        reason_map = {"stop": "STOP", "length": "MAX_TOKENS",
+                      "content_filter": "SAFETY", "tool_calls": "STOP",
+                      "function_call": "STOP"}
+        chunks.append(ModelResponseChunk(
+            function_calls=calls,
+            finish_reason=reason_map.get(choice.get("finish_reason") or "stop", "STOP"),
+            usage=usage))
+        return chunks
 
     async def _open_stream(self, body: dict) -> AsyncIterator[ModelResponseChunk]:
         session = aiohttp.ClientSession(

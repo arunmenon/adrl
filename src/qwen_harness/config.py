@@ -35,6 +35,10 @@ class Config:
     approval_mode: ApprovalMode = ApprovalMode.DEFAULT
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
 
+    # adrl experiment knobs (not upstream): prompt ablation + schema diet
+    prompt_variant: str = "full"      # full | lean | minimal | minimal-noex
+    slim_tool_schemas: bool = False   # first-sentence tool/param descriptions
+
     max_session_turns: int = 0        # 0/negative = unlimited (getMaxSessionTurns)
     max_turns: int = 100              # MAX_TURNS recursion bound in client.ts
     max_tool_calls_per_turn: int = 100

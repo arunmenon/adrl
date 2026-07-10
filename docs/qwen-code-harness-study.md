@@ -138,6 +138,16 @@ disk; telemetry, IDE context, MCP, OAuth, and the Ink UI are absent; thoughts
 ride the OpenAI `reasoning_content` field only. Each omission is flagged in
 the module docstrings.
 
+## The prompt-variant experiment (adrl knobs, not upstream)
+
+To measure what the prompt actually buys on small models, the port adds two
+ablation knobs — `--prompt-variant {full,lean,minimal,minimal-noex}` (section
+ablation, 4,413 → 1,615 tokens of turn-1 prefix with `--slim-tools`) and
+`--slim-tools` (first-sentence tool/param descriptions) — plus a grid runner,
+`python -m qwen_harness.experiments.prompt_variants`, that drives the real
+loop through planted-task sandboxes with objective verifiers. Setup,
+measured footprints, and the runbook: `reports/prompt-variant-eval-plan.md`.
+
 ## Why this lives in adrl
 
 The routing layer treats the harness as a black box on the wire. This port

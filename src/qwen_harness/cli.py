@@ -136,6 +136,13 @@ def build(argv: list[str] | None = None):
                         help="shorthand for --approval-mode yolo")
     parser.add_argument("--cwd", default=None, help="workspace directory")
     parser.add_argument("--max-session-turns", type=int, default=0)
+    parser.add_argument("--prompt-variant", default="full",
+                        help="prompt ablation: full | lean | minimal | minimal-noex")
+    parser.add_argument("--slim-tools", action="store_true",
+                        help="first-sentence tool/param descriptions")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="non-streaming completions (reliable tool calls "
+                             "on some local servers)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
 
@@ -149,6 +156,10 @@ def build(argv: list[str] | None = None):
     config.approval_mode = (ApprovalMode.YOLO if args.yolo
                             else ApprovalMode(args.approval_mode))
     config.max_session_turns = args.max_session_turns
+    config.prompt_variant = args.prompt_variant
+    config.slim_tool_schemas = args.slim_tools
+    if args.no_stream:
+        config.generator.streaming = False
     config.debug = args.debug
     config.set_interactive(args.prompt is None)
 

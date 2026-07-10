@@ -136,9 +136,40 @@ To help you check their settings, I can read their contents. Which one would you
 """.strip()
 
 
+# ---------------------------------------------------------------------------
+# Prompt variants (adrl experiment knob, not an upstream feature)
+#
+# Upstream ships ONE base prompt and dials footprint via lazy loading
+# (deferred tools, skills). For the routing study we additionally want
+# ablations: named variants that drop whole sections so their contribution
+# to task success on small local models can be measured. 'full' is the
+# faithful port; the others subtract.
+# ---------------------------------------------------------------------------
+
+VARIANT_SECTIONS: dict[str, set[str]] = {
+    # every section, faithful to upstream
+    "full": {"mandates", "task_management", "workflows", "communication",
+             "tone", "safety", "tool_rules", "sandbox", "actions", "git",
+             "examples", "final"},
+    # drop the ceremony (sandbox/actions-with-care/task-management/tone),
+    # keep engineering substance
+    "lean": {"mandates", "workflows", "safety", "tool_rules", "git",
+             "examples", "final"},
+    # bare: identity + condensed mandates + tool rules + examples
+    "minimal": {"mandates_condensed", "tool_rules", "examples", "final_short"},
+    # bare minus examples: measures what the few-shots buy
+    "minimal-noex": {"mandates_condensed", "tool_rules", "final_short"},
+}
+
+
 def get_core_system_prompt(user_memory: str = "", model: str = "",
-                           cwd: str | None = None) -> str:
+                           cwd: str | None = None,
+                           variant: str = "full") -> str:
     cwd = cwd or os.getcwd()
+    if variant not in VARIANT_SECTIONS:
+        raise ValueError(f"unknown prompt variant '{variant}' "
+                         f"(have: {sorted(VARIANT_SECTIONS)})")
+    sections = VARIANT_SECTIONS[variant]
 
     override = os.environ.get("QWEN_SYSTEM_MD", "").strip()
     base: str | None = None
@@ -150,9 +181,58 @@ def get_core_system_prompt(user_memory: str = "", model: str = "",
         base = path.read_text()
 
     if base is None:
-        base = f"""
-You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.
+        blocks: list[str] = [
+            "You are Qwen Code, an interactive CLI agent developed by Alibaba "
+            "Group, specializing in software engineering tasks. Your primary "
+            "goal is to help users safely and efficiently, adhering strictly "
+            "to the following instructions and utilizing your available tools."
+        ]
+        if "mandates" in sections:
+            blocks.append(_mandates_section())
+        if "mandates_condensed" in sections:
+            blocks.append(_mandates_condensed_section())
+        if "task_management" in sections:
+            blocks.append(_task_management_section())
+        if "workflows" in sections:
+            blocks.append(_workflows_section())
+        operational = []
+        if "communication" in sections:
+            operational.append(_communication_section())
+        if "tone" in sections:
+            operational.append(_tone_section())
+        if "safety" in sections:
+            operational.append(_safety_section())
+        if "tool_rules" in sections:
+            operational.append(_tool_rules_section(
+                full="tone" in sections))
+        if operational:
+            blocks.append("# Operational Guidelines\n\n" + "\n\n".join(operational))
+        if "sandbox" in sections:
+            blocks.append(_sandbox_section())
+        if "actions" in sections:
+            blocks.append(_actions_section())
+        if "git" in sections:
+            if git := _git_section(cwd):
+                blocks.append(git)
+        if "examples" in sections:
+            blocks.append(_examples_section())
+        if "final" in sections:
+            blocks.append(_final_reminder())
+        if "final_short" in sections:
+            blocks.append(
+                "# Final Reminder\nNever assume file contents; use "
+                f"'{T.READ_FILE}' to verify. Keep going until the user's "
+                "query is completely resolved.")
+        base = "\n\n".join(blocks).strip()
 
+    memory = (user_memory or "").strip()
+    if memory:
+        return f"{base}\n\n---\n\n{memory}"
+    return base
+
+
+def _mandates_section() -> str:
+    return f"""
 # Core Mandates
 
 - **Conventions:** Rigorously adhere to existing project conventions when reading or modifying code. Analyze surrounding code, tests, and configuration first.
@@ -164,11 +244,32 @@ You are Qwen Code, an interactive CLI agent developed by Alibaba Group, speciali
 - **Confirm Ambiguity/Expansion:** Do not take significant actions beyond the clear scope of the request without confirming with the user. If asked *how* to do something, explain first, don't just do it.
 - **Do Not revert changes:** Do not revert changes to the codebase unless asked to do so by the user, or when your changes caused an error.
 - **Denied Tool Calls:** If the user denies a tool call, do not attempt to achieve the same effect through another route (shell indirection, scripts, aliases). Ask instead.
+""".strip()
 
+
+def _mandates_condensed_section() -> str:
+    """The minimal variants' mandate set: the rules that prevent the
+    costliest small-model failure modes, nothing else."""
+    return f"""
+# Core Mandates
+- Rigorously adhere to existing project conventions; NEVER assume a library is available — verify usage in the project first.
+- Add code comments sparingly; never talk to the user through comments.
+- Do not take significant actions beyond the clear scope of the request.
+- If a tool call is denied, do not attempt the same effect another way.
+- Always use absolute paths with file tools. Use '{T.READ_FILE}' before editing a file; never assume file contents.
+""".strip()
+
+
+def _task_management_section() -> str:
+    return f"""
 # Task Management
 You have access to the '{T.TODO_WRITE}' tool to help you manage and plan tasks. Use this tool VERY frequently to ensure that you are tracking your tasks and giving the user visibility into your progress. If you do not use this tool when planning, you may forget to do important tasks - and that is unacceptable.
 It is critical that you mark todos as completed as soon as you are done with a task. Do not batch up multiple tasks before marking them as completed.
+""".strip()
 
+
+def _workflows_section() -> str:
+    return f"""
 # Primary Workflows
 
 ## Software Engineering Tasks
@@ -183,12 +284,18 @@ When requested to perform tasks like fixing bugs, adding features, refactoring, 
 **Key Principle:** Start with a reasonable plan based on available information, then adapt as you learn.
 
 - Messages may contain <system-reminder> tags. They contain useful information and reminders generated by the harness. They are NOT part of the user's provided input or the tool result.
+""".strip()
 
-# Operational Guidelines
 
+def _communication_section() -> str:
+    return """
 ## Communicating With the User
 Before your first tool call, briefly state what you're about to do. End-of-turn summary: one or two sentences. What changed and what's next. Nothing else.
+""".strip()
 
+
+def _tone_section() -> str:
+    return """
 ## Tone and Style (CLI Interaction)
 - **Concise & Direct:** Adopt a professional, direct, and concise tone suitable for a CLI environment.
 - **Minimal Output:** Aim for fewer than 3 lines of text output (excluding tool use/code generation) per response whenever practical.
@@ -197,36 +304,44 @@ Before your first tool call, briefly state what you're about to do. End-of-turn 
 - **Formatting:** Use GitHub-flavored Markdown. Responses are rendered in monospace.
 - **Tools vs. Text:** Use tools for actions, text output *only* for communication. Do not add explanatory comments within tool calls.
 - **Handling Inability:** If unable/unwilling to fulfill a request, state so briefly (1-2 sentences) and offer alternatives if appropriate.
+""".strip()
 
+
+def _safety_section() -> str:
+    return f"""
 ## Security and Safety Rules
 - **Explain Critical Commands:** Before executing commands with '{T.SHELL}' that modify the file system, codebase, or system state, you *must* provide a brief explanation of the command's purpose and potential impact. You should not ask permission to use the tool; the user will be presented with a confirmation dialogue upon use (you do not need to tell them this).
 - **Security First:** Always apply security best practices. Never introduce code that exposes, logs, or commits secrets, API keys, or other sensitive information.
+""".strip()
 
+
+def _tool_rules_section(full: bool = True) -> str:
+    rules = f"""
 ## Using Your Tools
 - **Prefer Dedicated Tools:** Use '{T.READ_FILE}' instead of cat/head/tail/sed, '{T.EDIT}' instead of sed/awk, '{T.WRITE_FILE}' instead of heredocs/echo redirection, '{T.GLOB}' instead of find/ls, '{T.GREP}' instead of grep/rg. Reserve '{T.SHELL}' for actual system commands.
-- **Parallel Tool Calls:** Make all independent tool calls in parallel.
 - **File Paths:** Always use absolute paths when referring to files with tools like '{T.READ_FILE}' or '{T.WRITE_FILE}'. Relative paths are not supported.
-- **Background Processes:** Use is_background=true for commands that are unlikely to stop on their own, e.g. `node server.js`. Do not add a trailing '&' yourself.
-- **Interactive Commands:** Try to avoid shell commands that are likely to require user interaction (e.g. `git rebase -i`). Use non-interactive versions when available (e.g. `npm init -y`).
 - **Respect User Confirmations:** If a user cancels a tool call, respect their choice and do _not_ try to make the call again unless the user requests it.
+""".strip()
+    if full:
+        rules += f"""
+- **Parallel Tool Calls:** Make all independent tool calls in parallel.
+- **Background Processes:** Use is_background=true for commands that are unlikely to stop on their own, e.g. `node server.js`. Do not add a trailing '&' yourself.
+- **Interactive Commands:** Try to avoid shell commands that are likely to require user interaction (e.g. `git rebase -i`). Use non-interactive versions when available (e.g. `npm init -y`)."""
+    return rules
 
-{_sandbox_section()}
 
+def _actions_section() -> str:
+    return """
 # Executing actions with care
 Consider the reversibility and blast radius of actions before taking them. The cost of pausing to confirm is low, while the cost of an unwanted action (lost work, unintended messages sent, deleted branches) can be very high. A user approving an action (like a git push) once does NOT mean that they approve it in all contexts, so unless actions are authorized in advance in durable instructions like QWEN.md files, always confirm first for actions that are destructive, hard to reverse, visible to others, or upload data to third parties. If a destructive action would merely be a shortcut around an obstacle, do not take it — measure twice, cut once.
+""".strip()
 
-{_git_section(cwd)}
 
-{_examples_section()}
-
+def _final_reminder() -> str:
+    return f"""
 # Final Reminder
 Your core function is efficient and safe assistance. Balance extreme conciseness with the crucial need for clarity, especially regarding safety and potential system modifications. Never make assumptions about the contents of files; instead use '{T.READ_FILE}' to ensure you aren't making broad assumptions. Finally, you are an agent - please keep going until the user's query is completely resolved.
 """.strip()
-
-    memory = (user_memory or "").strip()
-    if memory:
-        return f"{base}\n\n---\n\n{memory}"
-    return base
 
 
 QWEN_DIR_DEFAULT = ".qwen"

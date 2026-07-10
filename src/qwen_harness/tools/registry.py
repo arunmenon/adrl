@@ -22,15 +22,38 @@ class ToolRegistry:
     def get_all_tool_names(self) -> list[str]:
         return sorted(self._tools)
 
-    def get_function_declarations(self) -> list[dict]:
+    def get_function_declarations(self, slim: bool = False) -> list[dict]:
         # sorted by name: keeps the tools block byte-stable across turns,
         # which protects provider prompt caches
-        return [self._tools[n].schema for n in sorted(self._tools)]
+        declarations = [self._tools[n].schema for n in sorted(self._tools)]
+        return [_slim_declaration(d) for d in declarations] if slim else declarations
 
     def suggest(self, name: str) -> str | None:
         """Cheap 'did you mean' for TOOL_NOT_REGISTERED errors."""
         candidates = sorted(self._tools, key=lambda t: _distance(name, t))
         return candidates[0] if candidates else None
+
+
+def _first_sentence(text: str) -> str:
+    for stop in (". ", ".\n"):
+        if stop in text:
+            return text[:text.index(stop) + 1]
+    return text
+
+
+def _slim_declaration(declaration: dict) -> dict:
+    """Schema diet (experiment knob): keep names, types, and required flags
+    intact; cut every description to its first sentence."""
+    slim = dict(declaration)
+    slim["description"] = _first_sentence(declaration.get("description", ""))
+    params = dict(declaration.get("parameters", {}))
+    if props := params.get("properties"):
+        params["properties"] = {
+            key: {**spec, **({"description": _first_sentence(spec["description"])}
+                             if "description" in spec else {})}
+            for key, spec in props.items()}
+    slim["parameters"] = params
+    return slim
 
 
 def _distance(a: str, b: str) -> int:

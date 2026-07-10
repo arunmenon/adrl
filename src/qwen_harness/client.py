@@ -63,7 +63,7 @@ class GeminiClient:
         user_memory, _count = load_hierarchical_memory(self.config.target_dir)
         system_instruction = get_core_system_prompt(
             user_memory=user_memory, model=self.config.model,
-            cwd=self.config.target_dir)
+            cwd=self.config.target_dir, variant=self.config.prompt_variant)
 
         # history[0]: environment context. Current qwen-code sends it as a
         # single <system-reminder>-wrapped user message; classic qwen-code /
@@ -76,7 +76,8 @@ class GeminiClient:
         self.chat = GeminiChat(
             generator=self.generator, model=self.config.model,
             system_instruction=system_instruction, history=history,
-            tools=self.registry.get_function_declarations())
+            tools=self.registry.get_function_declarations(
+                slim=self.config.slim_tool_schemas))
         self.chat.repair_orphaned_tool_calls()
         return self.chat
 
