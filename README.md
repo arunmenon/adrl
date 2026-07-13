@@ -2,16 +2,15 @@
 
 A routing layer for LLM coding agents that sits between coding harnesses (Claude Code / Codex CLI) and LiteLLM, deciding per user turn whether work goes to a local model (llama.cpp / MLX), cheap cloud, or a frontier model — with sticky per-turn routing to protect prompt caches, deterministic escalation trip-wires, a one-way privacy pin, and a flywheel of logged outcomes for tuning.
 
-## Status (2026-07-07)
+## Status (2026-07-12)
 
-**Phase 0 (shadow / evidence-gathering) in progress.** Design docs at v2 after two review
-passes. Workstream A (transcript mining) complete; B2 capture proxy live and accumulating
-organic traffic toward the ≥200-turn shadow-run gate; simulator (C2) operational with
-episode mode. Assumption test B4 answered (session keying: solved). Next: B5 tool-ID
-experiment, B6 wire fingerprints, B7 shadow router. Headline findings so far: traffic
-model validated (73.3% continuations vs 70-90% predicted); 99.3% cache-hit ratio;
-easy user turns are 45.5% of turns but only 3.7% of spend — the dollar lever is
-subagent traffic. See `reports/` for the evidence.
+**Phase 0 is complete; later phases have not passed their exit gates.** The repository
+now contains the live routing/cascade path, privacy and health gates, transaction memory,
+retrieval shadowing, deterministic verification, and an isolated counterfactual runner.
+The read-only subagent pilot, representative production-model evaluation, sufficient
+verified labels, and a trained Layer-2 router remain open. See
+`reports/phase0-exit.md`, `docs/phase1-plan.md`, and `reports/retrieval-shadow.md` for
+the measured gates rather than treating component presence as rollout completion.
 
 ## Repo map
 
@@ -29,6 +28,7 @@ data/        gitignored — corpus snapshot, wire captures, datasets, ledgers (r
 
 ## Documents
 
+- **[Frozen ADR taxonomy and decision index](docs/adr-index.md)** - canonical architecture buckets, permanent decision IDs, maturity, and change-control rules (Taxonomy v1.0)
 - [Design doc](docs/adaptive-routing-layer-design.md) — architecture, components, rollout plan (Draft v2)
 - [Scenario walkthroughs](docs/adaptive-routing-scenarios.md) — 15 wire-level traces through the layer (Draft v2)
 - [Deep-research vetting report](docs/deep-research-vetting.md) — verified findings, sources, and open questions behind the v2 amendments

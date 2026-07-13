@@ -35,6 +35,10 @@ Establish exactly what you are reviewing before you judge anything.
    scope, because the change re-exposes or fails to fix them.
 3. Note the languages/frameworks touched so you apply the right pitfalls in
    Phase 2.
+4. Resolve the architecture classification from the PR body or work description:
+   one primary ADRL ID, optional secondary IDs, decision effect, and any claimed
+   maturity transition. If it is absent, infer the likely primary ID for review
+   scope but retain the missing classification as a candidate finding.
 
 ## Phase 1 - Load the project's rules
 
@@ -44,6 +48,9 @@ review criteria:
   directory that is an ancestor of a changed file (a directory's file only
   applies at or below it).
 - Any linter/formatter/test config the repo pins.
+- `docs/adr-index.md`: read the full primary/secondary decision rows and their
+  linked evidence. Treat accepted decisions as contracts and D0-D5 as evidence
+  levels, not implementation labels.
 
 Only flag a convention violation when you can quote the exact rule and the exact
 line that breaks it. No style preferences, no "spirit of the doc."
@@ -95,6 +102,11 @@ Cleanup / design angles (lower priority than correctness):
     adds actually get read on the live path, or is it inert (dead config)? Does a
     commit message or docstring claim behavior the wiring doesn't deliver? These
     read as done but aren't.
+11. **Architecture grounding.** Does the primary ADRL ID actually own the changed
+    behavior? Does the diff violate an accepted decision, bypass a `SAF` gate, or
+    claim a maturity increase without the durable evidence required by
+    `docs/adr-index.md`? Is new behavior disguised as `adds evidence`, `none`, or
+    a refactor? Missing or materially wrong classification is a finding.
 
 ## Phase 3 - Verify each candidate adversarially
 
@@ -144,6 +156,16 @@ If a machine-readable form is wanted, also emit a JSON array of
 If nothing survives verification, say so plainly and note what you checked. Do
 not pad the list - a short, true report beats a long, hedged one. End by stating
 which parts, if any, you could not fully verify and why.
+
+After the findings, include a compact architecture grounding block:
+
+```text
+Primary ADRL ID: ADRL-___-___
+Secondary ADRL IDs: none
+Decision effect: ...
+Maturity claim: ...
+Decision contracts checked: ...
+```
 
 ---
 
