@@ -45,10 +45,31 @@ except Exception:  # pragma: no cover
         return body, None
 
 try:
-    from router.outcomes import outcome_proxy_hard
+    from router.outcomes import (
+        failure_cause_for,
+        outcome_proxy_hard,
+        task_signal_hard,
+    )
 except Exception:  # pragma: no cover
     def outcome_proxy_hard(row):  # type: ignore
         return False
+
+    def failure_cause_for(tripwire_type=None, *, infrastructure_failure=False):  # type: ignore
+        return "infrastructure" if infrastructure_failure else None
+
+    def task_signal_hard(*, tripwire_type=None, user_retried=False,
+                         continuation_count=0):  # type: ignore
+        return bool(user_retried) or int(continuation_count or 0) >= 10
+
+try:
+    from router.escalate import rebuild_for_escalation
+    from router.privacy import scan_content
+except Exception:  # pragma: no cover
+    def rebuild_for_escalation(messages, failure_note_lines=None):  # type: ignore
+        return messages
+
+    def scan_content(content):  # type: ignore
+        return []
 
 UPSTREAM = os.environ.get("CAPTURE_UPSTREAM", "https://api.anthropic.com")
 REDACT_HEADERS = {"authorization", "x-api-key", "cookie", "set-cookie"}
@@ -154,6 +175,7 @@ class AcquireResult:
     used_fallback: bool           # True iff a local failure fell open to Anthropic
     error: BaseException | None   # last connection error when every attempt failed
     sent_body: bytes | None       # body that produced ``response`` (for the capture)
+    served_upstream: str | None   # endpoint that actually produced ``response``
 
 
 async def acquire_upstream(attempts, send) -> AcquireResult:
@@ -185,8 +207,8 @@ async def acquire_upstream(attempts, send) -> AcquireResult:
             used_fallback = True
             error = None
             continue
-        return AcquireResult(resp, used_fallback, None, body)
-    return AcquireResult(None, used_fallback, error, None)
+        return AcquireResult(resp, used_fallback, None, body, upstream)
+    return AcquireResult(None, used_fallback, error, None, None)
 
 
 # ── WS2 routing mode helpers (pure; unit-tested in tests/test_router_proxy.py) ─
@@ -210,6 +232,23 @@ def liveplan_attempts(live_router, plan, body: dict) -> list[tuple[str, bytes | 
             live_router.build_forward_body(body, plan.fallback_model),
         ))
     return attempts
+
+
+def prepare_escalation_body(body: dict, decision) -> dict:
+    """Rebuild a failed transcript before forwarding it across model rungs."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return dict(body)
+    tripwire = str(getattr(decision, "tripwire", None) or "failure detector")
+    tripwire_type = str(getattr(decision, "tripwire_type", None) or "unknown")
+    note = [
+        "A lower-capability model could not complete this turn.",
+        f"Failure detector: {tripwire} ({tripwire_type}).",
+        "Continue from the recorded tool results without repeating the failed action.",
+    ]
+    rebuilt = dict(body)
+    rebuilt["messages"] = rebuild_for_escalation(messages, note)
+    return rebuilt
 
 
 def session_id_for(body: dict) -> str:
@@ -343,6 +382,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
     live_plan = None
     parsed_body: dict = {}
     session_id = None
+    blocked_reason = None
+    privacy_hits: list[str] = []
+    served_rung = None
 
     if app["route_user_turns"]:
         # ── WS2 LIVE routing: user_turn/continuation -> local/cheap/frontier ──
@@ -356,18 +398,65 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 parsed_body = {}
         except Exception:
             parsed_body = {}
+
+        session_id = session_id_for(parsed_body)
+        escalation = app["escalation"]
+        inbound = last_user_content(parsed_body)
+
+        # Privacy and tool-result failure evidence must be consumed BEFORE model
+        # selection. Otherwise the sensitive/failing continuation is already in
+        # flight by the time the post-call observer changes session state.
+        try:
+            privacy_hits = scan_content(inbound)
+            if privacy_hits:
+                escalation.store.pin_privacy(session_id)
+        except Exception:
+            privacy_hits = []
+
+        is_continuation = isinstance(inbound, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in inbound
+        )
+        if is_continuation:
+            try:
+                escalation.note_continuation(session_id)
+                escalation.observe_tool_results(session_id, inbound)
+            except Exception:
+                pass
+
+        handoff = None
+        try:
+            handoff = escalation.consume_pending(session_id)
+        except Exception:
+            handoff = None
+        if handoff is not None:
+            if bool(getattr(handoff, "to_user", False)):
+                blocked_reason = str(
+                    getattr(handoff, "reason", "privacy policy blocked escalation"))
+            elif getattr(handoff, "to_rung", None):
+                parsed_body = prepare_escalation_body(parsed_body, handoff)
+
         live_plan = live_router.plan(request.method, str(request.rel_url), parsed_body)
         routed_rung = live_plan.rung
         route_layer = live_plan.layer
         route_id = live_plan.route_id          # minted by the router's recorder
         routed_label = None                    # P1-A field is N/A in routing mode
-        attempts = liveplan_attempts(live_router, live_plan, parsed_body)
-        session_id = session_id_for(parsed_body)
+        blocked_reason = blocked_reason or getattr(live_plan, "blocked_reason", None)
+        attempts = (
+            [] if blocked_reason
+            else liveplan_attempts(live_router, live_plan, parsed_body)
+        )
         local_upstream = live_router.litellm_url
         # A user turn starts a fresh trip-wire window (per-turn strike reset).
         if live_plan.label == "user_turn":
             try:
                 app["escalation"].new_turn(session_id)
+            except Exception:
+                pass
+        elif live_plan.label == "continuation" and not is_continuation:
+            # Defensive compatibility for custom discriminators/test doubles.
+            try:
+                app["escalation"].note_continuation(session_id)
             except Exception:
                 pass
     else:
@@ -388,7 +477,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
         attempts = attempts_for(plan)
         local_upstream = app["local_upstream"]
 
-    primary_body_for_capture = attempts[0][1]
+    primary_body_for_capture = (
+        attempts[0][1] if attempts else json.dumps(parsed_body).encode()
+    )
     client: ClientSession = app["client"]
 
     async def _send(upstream_base: str, body: bytes | None):
@@ -408,38 +499,77 @@ async def handle(request: web.Request) -> web.StreamResponse:
             data=body if body else None, allow_redirects=False, **kwargs,
         )
 
-    result = await acquire_upstream(attempts, _send)
-    local_fallback = result.used_fallback
-    if local_fallback:
-        print(f"[local-fallback seq={seq}] local rung failed -> Anthropic (original body)")
-
-    upstream_resp = result.response
     chunks: list[bytes] = []
     resp_headers: dict[str, str] = {}
-    try:
-        if upstream_resp is None:  # every attempt (incl. any fallback) failed to connect
-            raise result.error if result.error else RuntimeError("no upstream response")
-        resp_headers = {
-            k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP
+    if blocked_reason:
+        payload = {
+            "type": "error",
+            "error": {
+                "type": "privacy_policy_conflict",
+                "message": blocked_reason,
+            },
         }
-        response = web.StreamResponse(status=upstream_resp.status, headers=resp_headers)
-        await response.prepare(request)
-        # Relay verbatim, chunk by chunk — SSE streams stay live.
-        async for chunk in upstream_resp.content.iter_any():
-            chunks.append(chunk)
-            await response.write(chunk)
-        await response.write_eof()
-        status = upstream_resp.status
-    except Exception as exc:  # upstream failure — surface honestly, log it
-        status = 502
-        response = web.json_response(
-            {"type": "error", "error": {"type": "proxy_upstream_error", "message": str(exc)}},
-            status=502,
-        )
-        chunks = [json.dumps({"proxy_error": str(exc)}).encode()]
-    finally:
-        if upstream_resp is not None:
-            await upstream_resp.release()
+        encoded = json.dumps(payload).encode()
+        result = AcquireResult(None, False, None, primary_body_for_capture, None)
+        local_fallback = False
+        upstream_resp = None
+        chunks = [encoded]
+        resp_headers = {"content-type": "application/json"}
+        status = 409
+        response = web.json_response(payload, status=status)
+        served_rung = "blocked"
+    else:
+        result = await acquire_upstream(attempts, _send)
+        local_fallback = result.used_fallback
+        monitor = app.get("health_monitor")
+        if monitor is not None and app["route_user_turns"]:
+            try:
+                if local_fallback:
+                    monitor.record_failure(routed_rung, str(result.error or "fallback"))
+                    if result.response is not None and result.response.status < 400:
+                        monitor.record_success("frontier")
+                elif result.response is not None and result.response.status < 400:
+                    monitor.record_success(routed_rung)
+                else:
+                    monitor.record_failure(
+                        routed_rung, str(result.error or "upstream status failure"))
+            except Exception:
+                pass
+        if local_fallback:
+            print(f"[local-fallback seq={seq}] routed rung failed -> Anthropic (original body)")
+            if app["route_user_turns"] and session_id is not None:
+                try:
+                    app["escalation"].note_infrastructure_failure(session_id)
+                    app["escalation"].sync_served_route(session_id, "frontier")
+                except Exception:
+                    pass
+        served_rung = "frontier" if local_fallback else routed_rung
+
+        upstream_resp = result.response
+        try:
+            if upstream_resp is None:  # every attempt (incl. any fallback) failed to connect
+                raise result.error if result.error else RuntimeError("no upstream response")
+            resp_headers = {
+                k: v for k, v in upstream_resp.headers.items() if k.lower() not in HOP_BY_HOP
+            }
+            response = web.StreamResponse(status=upstream_resp.status, headers=resp_headers)
+            await response.prepare(request)
+            # Relay verbatim, chunk by chunk — SSE streams stay live.
+            async for chunk in upstream_resp.content.iter_any():
+                chunks.append(chunk)
+                await response.write(chunk)
+            await response.write_eof()
+            status = upstream_resp.status
+        except Exception as exc:  # upstream failure — surface honestly, log it
+            status = 502
+            response = web.json_response(
+                {"type": "error", "error": {"type": "proxy_upstream_error", "message": str(exc)}},
+                status=502,
+            )
+            chunks = [json.dumps({"proxy_error": str(exc)}).encode()]
+        finally:
+            if upstream_resp is not None:
+                await upstream_resp.release()
 
     # ── WS2 post-call: observe the outcome + record it to the flywheel ───────
     # For a user_turn/continuation, reconstruct the assistant blocks from the
@@ -457,9 +587,6 @@ async def handle(request: web.Request) -> web.StreamResponse:
         decision = None
         try:
             escalation = app["escalation"]
-            inbound = last_user_content(parsed_body)   # tool_results on a continuation
-            if inbound:
-                escalation.observe_tool_results(session_id, inbound)
             decision = escalation.observe_response(
                 session_id, blocks, output_tokens=out_tokens)
         except Exception:
@@ -479,37 +606,77 @@ async def handle(request: web.Request) -> web.StreamResponse:
                 except Exception:
                     accumulated = False
                 escalated = accumulated or bool(getattr(decision, "escalate", False))
-                # Populate the execution-friction signals so the outcome's
-                # derived `outcome_proxy_hard` is actually set (review finding: it
-                # was left None, so went_hard ignored friction and a turn that hit
-                # errored tool results but never escalated was mislabeled easy).
-                # The per-turn trip-wire strikes ({edit, parse, loop, noprog}) are
-                # accumulated by the observe_* calls above and reset each new turn.
+                # Read one canonical, cumulative turn snapshot. Older injected
+                # test doubles may not expose snapshot(), so retain a narrow
+                # store-based fallback for compatibility.
+                evidence = None
                 try:
-                    strikes = app["escalation"].store.get_session(
-                        session_id).strikes or {}
+                    evidence = app["escalation"].snapshot(session_id)
                 except Exception:
-                    strikes = {}
-                edit_failures = int(strikes.get("edit", 0) or 0)
-                error_results = int(strikes.get("parse", 0) or 0)  # errored/malformed tool wire
-                interrupted = getattr(decision, "tripwire", None) == "user_interrupt"
+                    evidence = None
+                if evidence is None:
+                    try:
+                        state = app["escalation"].store.get_session(session_id)
+                        strikes = state.strikes or {}
+                        continuation_count = int(
+                            getattr(state, "continuation_count", 0) or 0)
+                    except Exception:
+                        strikes, continuation_count = {}, 0
+                    edit_failures = int(strikes.get("edit", 0) or 0)
+                    error_results = int(strikes.get("parse", 0) or 0)
+                    cumulative_tokens = int(out_tokens)
+                    tripwire_name = getattr(decision, "tripwire", None)
+                    tripwire_type = getattr(decision, "tripwire_type", None)
+                    infrastructure_failures = int(bool(local_fallback))
+                else:
+                    edit_failures = int(evidence.edit_failures)
+                    error_results = int(evidence.error_results)
+                    cumulative_tokens = int(evidence.output_tokens)
+                    continuation_count = int(evidence.continuation_count)
+                    tripwire_name = evidence.tripwire_name
+                    tripwire_type = evidence.tripwire_type
+                    infrastructure_failures = int(evidence.infrastructure_failures)
+                try:
+                    escalation.mark_turn_clean(
+                        session_id,
+                        status < 400
+                        and not blocked_reason
+                        and tripwire_name is None
+                        and edit_failures == 0
+                        and error_results == 0
+                        and infrastructure_failures == 0,
+                    )
+                except Exception:
+                    pass
+                interrupted = tripwire_name == "user_interrupt"
                 proxy_hard = outcome_proxy_hard({
                     "n_edit_failures": edit_failures,
                     "n_error_results": error_results,
                     "interrupted": interrupted,
-                    "n_continuations": 0,  # per-turn continuation count not at this seam
+                    "n_continuations": continuation_count,
                 })
+                cause = failure_cause_for(
+                    tripwire_type,
+                    infrastructure_failure=infrastructure_failures > 0,
+                )
+                task_hard = task_signal_hard(
+                    tripwire_type=tripwire_type,
+                    continuation_count=continuation_count,
+                )
                 outcome = outcome_cls(
                     status="closed_turn",
                     escalated=escalated,
-                    tripwire_name=getattr(decision, "tripwire", None),
-                    tripwire_type=getattr(decision, "tripwire_type", None),
+                    tripwire_name=tripwire_name,
+                    tripwire_type=tripwire_type,
                     edit_failures=edit_failures,
                     error_results=error_results,
                     interrupted=bool(interrupted),
-                    output_tokens=int(out_tokens),
+                    output_tokens=cumulative_tokens,
                     latency_ms=float(latency_ms),
                     outcome_proxy_hard=proxy_hard,
+                    continuation_count=continuation_count,
+                    failure_cause=cause,
+                    task_signal_hard=task_hard,
                 )
                 app["recorder"].attach(session_id, outcome)
         except Exception:
@@ -536,6 +703,9 @@ async def handle(request: web.Request) -> web.StreamResponse:
             "routed_rung": routed_rung,        # WS2: rung the LiveRouter chose (null in capture-only)
             "route_layer": route_layer,        # WS2: which policy layer decided
             "route_id": route_id,              # WS2: memory route_id for this decision
+            "served_rung": served_rung,        # WS2: actual rung after any fail-open
+            "privacy_hits": privacy_hits,      # pattern names only; never matched values
+            "blocked_reason": blocked_reason,
         }
         out = _capture_dir(app["capture_root"]) / f"{int(started * 1000)}-{seq:06d}.json"
         out.write_text(json.dumps(record))
@@ -551,7 +721,7 @@ async def make_app(capture_root: Path, route_utility: bool = False,
                    memory_db: str = "data/router-memory.db",
                    decision_source: str = "organic",
                    live_router=None, escalation=None,
-                   recorder=None) -> web.Application:
+                   recorder=None, health_monitor=None) -> web.Application:
     """Build the proxy app. ``route_user_turns`` is the WS2 flag: OFF (default,
     :4000) keeps every path byte-identical to the capture-only proxy and never
     constructs any router live-decision object. ON (the dedicated routing-proxy
@@ -568,8 +738,18 @@ async def make_app(capture_root: Path, route_utility: bool = False,
     app["recorder"] = None
     app["session_store"] = None
     app["outcome_cls"] = None
+    app["health_monitor"] = health_monitor
 
     if route_user_turns:
+        if health_monitor is None:
+            health_monitor = getattr(live_router, "health", None)
+        if health_monitor is None:
+            try:
+                from router.health import RungHealthMonitor
+                health_monitor = RungHealthMonitor()
+            except Exception:
+                health_monitor = None
+        app["health_monitor"] = health_monitor
         # Build (or accept injected) the ONE-per-process routing singletons. All
         # three share ONE session store so the router's continuation-stickiness,
         # the controller's escalation flips, and the memory recording agree.
@@ -606,9 +786,16 @@ async def make_app(capture_root: Path, route_utility: bool = False,
             store = DictSessionStore()
             recorder = RoutingRecorder(RouterMemory(providers))
             escalation = EscalationController(store)
-            live_router = LiveRouter(store=store, memory=recorder,
-                                     classifier=classifier, source=decision_source)
+            live_router = LiveRouter(
+                store=store, memory=recorder, classifier=classifier,
+                health=health_monitor, source=decision_source,
+            )
             app["session_store"] = store
+        elif getattr(live_router, "health", None) is None:
+            try:
+                live_router.health = health_monitor
+            except Exception:
+                pass
         app["live_router"] = live_router
         app["escalation"] = escalation
         app["recorder"] = recorder

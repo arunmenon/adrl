@@ -7,11 +7,13 @@ SQLite file (WAL mode, single-writer) at ``data/router-memory.db``:
                   idempotent ingestion, Engram ADR 0004)
     outcomes    — one companion row per decision; lifecycle is forward-only
                   (pending -> closed_turn -> closed_final, never backwards)
+    outcome_events — immutable, idempotent audit events behind that projection
     embeddings  — 768-dim float32 little-endian BLOBs, own table/cadence;
                   absent entirely for privacy-pinned turns
 
-Retrieval is a **projection** (Engram ADR 0005): an in-RAM normalized numpy
-matrix + aligned metadata, rebuilt only when the underlying rowcounts change
+The schema is versioned with ``PRAGMA user_version`` and upgrades pre-v2
+ledgers in place. Retrieval is a **projection** (Engram ADR 0005): an in-RAM
+normalized numpy matrix + aligned metadata, rebuilt only when rowcounts change
 (cheap check), never a per-query SELECT-all. Only ``closed_*`` outcomes are
 visible to kNN.
 
@@ -31,8 +33,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -48,11 +53,13 @@ from router.memory_ports import (
     MemoryProvider,
     NeighborTurn,
     OutcomeEvent,
+    VerifiedOutcome,
 )
 
 _ProviderBase = MemoryProvider
 
 DEFAULT_DB_PATH = Path("data/router-memory.db")
+SCHEMA_VERSION = 3
 
 STORAGE_PREFIX = DOCUMENT_PREFIX  # backwards-compatible alias
 
@@ -77,7 +84,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     propensity      TEXT,
     policy_version  TEXT,
     classifier_ms   REAL,
-    decision_ms     REAL
+    decision_ms     REAL,
+    trace_json      TEXT DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS outcomes (
     route_id           TEXT PRIMARY KEY REFERENCES decisions(route_id),
@@ -92,16 +100,95 @@ CREATE TABLE IF NOT EXISTS outcomes (
     cost_estimate      REAL,
     interrupted        INT,
     user_retried       INT,
-    outcome_proxy_hard INT
+    outcome_proxy_hard INT,
+    continuation_count INT DEFAULT 0,
+    failure_cause      TEXT,
+    task_signal_hard   INT,
+    verified_success   INT,
+    quality_score      REAL,
+    verifier_source    TEXT,
+    verifier_confidence REAL,
+    verified_at        REAL,
+    verification_failure_cause TEXT
 );
 CREATE TABLE IF NOT EXISTS embeddings (
     route_id TEXT PRIMARY KEY REFERENCES decisions(route_id),
     dim      INT,
     vec      BLOB
 );
+CREATE TABLE IF NOT EXISTS outcome_events (
+    event_id     TEXT PRIMARY KEY,
+    route_id     TEXT REFERENCES decisions(route_id),
+    observed_at  REAL,
+    status       TEXT,
+    payload_json TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_outcomes_status ON outcomes(status);
+CREATE INDEX IF NOT EXISTS idx_outcome_events_route ON outcome_events(route_id, observed_at);
 """
+
+_DECISION_MIGRATIONS = {
+    "trace_json": "TEXT DEFAULT '{}'",
+}
+
+_OUTCOME_MIGRATIONS = {
+    "continuation_count": "INT DEFAULT 0",
+    "failure_cause": "TEXT",
+    "task_signal_hard": "INT",
+    "verified_success": "INT",
+    "quality_score": "REAL",
+    "verifier_source": "TEXT",
+    "verifier_confidence": "REAL",
+    "verified_at": "REAL",
+    "verification_failure_cause": "TEXT",
+}
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade pre-versioned ledgers in place without rewriting user data."""
+    current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current_version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"memory schema {current_version} is newer than supported {SCHEMA_VERSION}"
+        )
+    for table, additions in (
+        ("decisions", _DECISION_MIGRATIONS),
+        ("outcomes", _OUTCOME_MIGRATIONS),
+    ):
+        present = _column_names(conn, table)
+        for column, declaration in additions.items():
+            if column not in present:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                )
+
+    if current_version < 2:
+        # Recover cause-clean labels only where old rows carry enough evidence.
+        conn.execute(
+            "UPDATE outcomes SET task_signal_hard = CASE "
+            "WHEN user_retried = 1 THEN 1 "
+            "WHEN lower(COALESCE(tripwire_type, '')) LIKE '%dialect' THEN 0 "
+            "WHEN lower(COALESCE(tripwire_type, '')) LIKE '%difficulty' THEN 1 "
+            "WHEN lower(COALESCE(tripwire_type, '')) LIKE '%cost' THEN 1 "
+            "WHEN lower(COALESCE(tripwire_type, '')) LIKE '%quality' THEN 1 "
+            "ELSE task_signal_hard END "
+            "WHERE task_signal_hard IS NULL"
+        )
+        # Existing mutable rows become one auditable migration baseline. Future
+        # accepted lifecycle writes append their own immutable event.
+        conn.execute(
+            "INSERT OR IGNORE INTO outcome_events "
+            "(event_id, route_id, observed_at, status, payload_json) "
+            "SELECT 'legacy:' || o.route_id || ':' || COALESCE(o.status, 'unknown'), "
+            "o.route_id, COALESCE(d.ts, 0), o.status, '{\"source\":\"v2_migration\"}' "
+            "FROM outcomes o JOIN decisions d ON d.route_id = o.route_id"
+        )
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def _as_nullable_int(value: Optional[bool]) -> Optional[int]:
@@ -111,6 +198,67 @@ def _as_nullable_int(value: Optional[bool]) -> Optional[int]:
 
 def _as_nullable_bool(value: Optional[int]) -> Optional[bool]:
     return None if value is None else bool(value)
+
+
+def _as_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+
+def _outcome_payload(outcome: OutcomeEvent) -> str:
+    try:
+        return json.dumps(asdict(outcome), default=str, sort_keys=True)
+    except Exception:
+        return "{}"
+
+
+def _normalise_verification(
+    verification: VerifiedOutcome, *, default_time: float,
+) -> Optional[VerifiedOutcome]:
+    """Validate verifier evidence before it enters the learned-data projection."""
+    if not isinstance(verification, VerifiedOutcome):
+        return None
+    if verification.task_success is not None and not isinstance(
+        verification.task_success, bool
+    ):
+        return None
+    source = str(verification.verifier_source or "").strip()
+    if not source or len(source) > 128:
+        return None
+
+    def bounded(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError
+        result = float(value)
+        if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+            raise ValueError
+        return result
+
+    try:
+        quality = bounded(verification.quality_score)
+        confidence = bounded(verification.confidence)
+        verified_at = float(
+            default_time if verification.verified_at is None
+            else verification.verified_at)
+        if not math.isfinite(verified_at) or verified_at < 0.0:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    failure_cause = _as_text(verification.failure_cause)
+    if verification.task_success is True and failure_cause:
+        return None
+    return VerifiedOutcome(
+        task_success=verification.task_success,
+        quality_score=quality,
+        verifier_source=source,
+        confidence=confidence,
+        verified_at=verified_at,
+        failure_cause=failure_cause,
+    )
 
 
 def decode_embedding(blob, dim) -> Optional[np.ndarray]:
@@ -151,15 +299,31 @@ class SqliteProvider(_ProviderBase):
         # outcome_proxy_hard (review finding), so this makes the projection
         # refresh after any outcome change on this provider.
         self._outcome_writes = 0
+        conn: Optional[sqlite3.Connection] = None
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            existing_version = int(
+                conn.execute("PRAGMA user_version").fetchone()[0])
+            if existing_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"memory schema {existing_version} is newer than supported "
+                    f"{SCHEMA_VERSION}"
+                )
             conn.executescript(_SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            _migrate_schema(conn)
             conn.commit()
             self._conn = conn
         except Exception:
+            try:
+                if conn is not None:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
             self._conn = None  # degraded: every method answers fail-safe
 
     # ── writes ───────────────────────────────────────────────────────────
@@ -196,8 +360,12 @@ class SqliteProvider(_ProviderBase):
                 emb_blob = (int(vector.shape[0]), vector.tobytes())
 
             self._conn.execute(
-                "INSERT OR IGNORE INTO decisions VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO decisions "
+                "(route_id, ts, session_id, turn_index, source, instr_sha256, "
+                "features_json, layer, rung, cascade, score, reason, "
+                "classifier_tier, propensity, policy_version, classifier_ms, "
+                "decision_ms, trace_json) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     decision.route_id,
                     decision.ts,
@@ -216,6 +384,7 @@ class SqliteProvider(_ProviderBase):
                     decision.policy_version,
                     decision.classifier_ms,
                     decision.decision_ms,
+                    decision.trace_json,
                 ),
             )
             self._conn.execute(
@@ -224,6 +393,13 @@ class SqliteProvider(_ProviderBase):
                 "cost_estimate, interrupted) "
                 "VALUES (?, 'pending', 0, 0, 0, 0, 0.0, 0.0, 0)",
                 (decision.route_id,),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO outcome_events "
+                "(event_id, route_id, observed_at, status, payload_json) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (f"{decision.route_id}:pending", decision.route_id, decision.ts,
+                 '{"source":"decision"}'),
             )
             if emb_blob is not None:
                 self._conn.execute(
@@ -249,6 +425,13 @@ class SqliteProvider(_ProviderBase):
         if self._conn is None:
             return False
         try:
+            event_id = str(outcome.event_id or "")
+            duplicate = self._conn.execute(
+                "SELECT route_id FROM outcome_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if duplicate is not None:
+                return duplicate[0] == route_id
             new_rank = _LIFECYCLE_RANK.get(outcome.status)
             if new_rank is None:
                 return False
@@ -260,11 +443,18 @@ class SqliteProvider(_ProviderBase):
             current_rank = _LIFECYCLE_RANK.get(row[0], 0)
             if row[0] == "closed_final" or new_rank < current_rank:
                 return False  # terminal, or a backward transition — rejected
+            observed_at = float(outcome.observed_at)
+            verification = (
+                _normalise_verification(
+                    outcome.verification, default_time=observed_at)
+                if outcome.verification is not None else None
+            )
             self._conn.execute(
                 "UPDATE outcomes SET status=?, escalated=?, tripwire_name=?, "
                 "tripwire_type=?, edit_failures=?, error_results=?, "
                 "output_tokens=?, latency_ms=?, cost_estimate=?, interrupted=?, "
-                "user_retried=?, outcome_proxy_hard=? WHERE route_id=?",
+                "user_retried=?, outcome_proxy_hard=?, continuation_count=?, "
+                "failure_cause=?, task_signal_hard=? WHERE route_id=?",
                 (
                     outcome.status,
                     int(bool(outcome.escalated)),
@@ -278,11 +468,107 @@ class SqliteProvider(_ProviderBase):
                     int(bool(outcome.interrupted)),
                     _as_nullable_int(outcome.user_retried),
                     _as_nullable_int(outcome.outcome_proxy_hard),
+                    int(outcome.continuation_count or 0),
+                    _as_text(outcome.failure_cause),
+                    _as_nullable_int(outcome.task_signal_hard),
                     route_id,
                 ),
             )
+            if verification is not None:
+                self._conn.execute(
+                    "UPDATE outcomes SET verified_success=?, quality_score=?, "
+                    "verifier_source=?, verifier_confidence=?, verified_at=?, "
+                    "verification_failure_cause=? WHERE route_id=?",
+                    (
+                        _as_nullable_int(verification.task_success),
+                        verification.quality_score,
+                        verification.verifier_source,
+                        verification.confidence,
+                        verification.verified_at,
+                        _as_text(verification.failure_cause),
+                        route_id,
+                    ),
+                )
+            self._conn.execute(
+                "INSERT INTO outcome_events "
+                "(event_id, route_id, observed_at, status, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event_id, route_id, observed_at, outcome.status,
+                 _outcome_payload(outcome)),
+            )
             self._conn.commit()
             self._outcome_writes += 1   # invalidate stale kNN projection
+            return True
+        except Exception:
+            self._safe_rollback()
+            return False
+
+    def attach_verification(
+        self,
+        route_id: str,
+        verification: VerifiedOutcome,
+        *,
+        event_id: Optional[str] = None,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Append verifier evidence without replacing lifecycle telemetry.
+
+        Verification often arrives after ``closed_final``. It is therefore an
+        independent enrichment event, not another lifecycle transition. A
+        replayed ``event_id`` is idempotent and finalized outcomes remain
+        eligible for enrichment.
+        """
+        if self._conn is None:
+            return False
+        try:
+            event_key = str(event_id or uuid.uuid4().hex)
+            duplicate = self._conn.execute(
+                "SELECT route_id FROM outcome_events WHERE event_id = ?",
+                (event_key,),
+            ).fetchone()
+            if duplicate is not None:
+                return duplicate[0] == route_id
+            row = self._conn.execute(
+                "SELECT status FROM outcomes WHERE route_id = ?", (route_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            when = time.time() if observed_at is None else float(observed_at)
+            normalized = _normalise_verification(
+                verification, default_time=when)
+            if normalized is None:
+                return False
+            self._conn.execute(
+                "UPDATE outcomes SET verified_success=?, quality_score=?, "
+                "verifier_source=?, verifier_confidence=?, verified_at=?, "
+                "verification_failure_cause=? WHERE route_id=?",
+                (
+                    _as_nullable_int(normalized.task_success),
+                    normalized.quality_score,
+                    normalized.verifier_source,
+                    normalized.confidence,
+                    normalized.verified_at,
+                    _as_text(normalized.failure_cause),
+                    route_id,
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO outcome_events "
+                "(event_id, route_id, observed_at, status, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    event_key,
+                    route_id,
+                    when,
+                    row[0],
+                    json.dumps({
+                        "source": "verification",
+                        "verification": asdict(normalized),
+                    }, default=str, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+            self._outcome_writes += 1
             return True
         except Exception:
             self._safe_rollback()
@@ -310,8 +596,28 @@ class SqliteProvider(_ProviderBase):
                 return 0
             cursor = self._conn.execute(
                 "UPDATE outcomes SET status='closed_final', interrupted=?, "
-                "user_retried=? WHERE route_id=?",
-                (int(bool(prev_interrupted)), int(bool(prev_retried)), row[0]),
+                "user_retried=?, task_signal_hard=CASE WHEN ? THEN 1 "
+                "ELSE task_signal_hard END, failure_cause=CASE "
+                "WHEN ? AND failure_cause IS NULL THEN 'user_abort' "
+                "ELSE failure_cause END WHERE route_id=?",
+                (int(bool(prev_interrupted)), int(bool(prev_retried)),
+                 int(bool(prev_interrupted or prev_retried)),
+                 int(bool(prev_interrupted)), row[0]),
+            )
+            observed_at = time.time()
+            event_id = (
+                f"{row[0]}:final:{int(bool(prev_interrupted))}:"
+                f"{int(bool(prev_retried))}"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO outcome_events "
+                "(event_id, route_id, observed_at, status, payload_json) "
+                "VALUES (?, ?, ?, 'closed_final', ?)",
+                (event_id, row[0], observed_at, json.dumps({
+                    "prev_interrupted": bool(prev_interrupted),
+                    "prev_retried": bool(prev_retried),
+                    "source": "finalize_turn",
+                }, sort_keys=True)),
             )
             self._conn.commit()
             self._outcome_writes += 1   # invalidate stale kNN projection
@@ -324,25 +630,31 @@ class SqliteProvider(_ProviderBase):
 
     def _projection_current_fingerprint(self) -> Optional[tuple]:
         """Cheap staleness check: (embeddings rowcount, closed-outcome rowcount,
-        outcome-mutation counter).
+        SQLite data version, outcome-mutation counter).
 
         The two counts catch new embedding rows and pending->closed promotions;
-        the mutation counter (bumped on every attach/finalize) additionally
+        ``PRAGMA data_version`` changes when another connection commits, so an
+        offline verifier process invalidates an already-warm live projection.
+        The mutation counter (bumped on every attach/finalize) additionally
         catches in-place UPDATEs to escalated / outcome_proxy_hard that leave
-        the row counts unchanged (review finding) — without scanning any BLOBs."""
+        the row counts unchanged on this connection, without scanning BLOBs."""
         row = self._conn.execute(
             "SELECT (SELECT COUNT(*) FROM embeddings), "
             "(SELECT COUNT(*) FROM outcomes WHERE status IN (?, ?))",
             _CLOSED_STATUSES,
         ).fetchone()
-        return (row[0], row[1], self._outcome_writes)
+        version_row = self._conn.execute("PRAGMA data_version").fetchone()
+        data_version = int(version_row[0]) if version_row else 0
+        return (row[0], row[1], data_version, self._outcome_writes)
 
     def _refresh_projection(self) -> None:
         """Rebuild the normalized in-RAM matrix + aligned metadata from the
         ledger (a projection per Engram ADR 0005 — always rebuildable)."""
         rows = self._conn.execute(
             "SELECT e.route_id, e.dim, e.vec, d.rung, d.source, d.ts, "
-            "o.escalated, o.outcome_proxy_hard, d.session_id, o.user_retried "
+            "o.escalated, o.outcome_proxy_hard, d.session_id, o.user_retried, "
+            "o.task_signal_hard, o.verified_success, "
+            "o.verification_failure_cause "
             "FROM embeddings e "
             "JOIN decisions d ON d.route_id = e.route_id "
             "JOIN outcomes o ON o.route_id = e.route_id "
@@ -352,7 +664,8 @@ class SqliteProvider(_ProviderBase):
         vectors: list[np.ndarray] = []
         metadata: list[dict] = []
         for (route_id, dim, blob, rung, source, ts, escalated, proxy_hard,
-             session_id, user_retried) in rows:
+             session_id, user_retried, task_hard, verified_success,
+             verification_failure_cause) in rows:
             vector = decode_embedding(blob, dim)  # shared decoder; None on bad blob
             if vector is None:
                 continue
@@ -372,6 +685,9 @@ class SqliteProvider(_ProviderBase):
                     "ts": ts,
                     "session_id": session_id,
                     "user_retried": _as_nullable_bool(user_retried),
+                    "task_signal_hard": _as_nullable_bool(task_hard),
+                    "verified_success": _as_nullable_bool(verified_success),
+                    "verification_failure_cause": verification_failure_cause,
                 }
             )
         self._projection_matrix = np.vstack(vectors) if vectors else None
@@ -415,6 +731,10 @@ class SqliteProvider(_ProviderBase):
                     ts=self._projection_meta[i]["ts"],
                     session_id=self._projection_meta[i]["session_id"],
                     user_retried=self._projection_meta[i]["user_retried"],
+                    task_signal_hard=self._projection_meta[i]["task_signal_hard"],
+                    verified_success=self._projection_meta[i]["verified_success"],
+                    verification_failure_cause=self._projection_meta[i][
+                        "verification_failure_cause"],
                 )
                 for i in top
             ]
@@ -460,12 +780,18 @@ class SqliteProvider(_ProviderBase):
             embedding_count = self._conn.execute(
                 "SELECT COUNT(*) FROM embeddings"
             ).fetchone()[0]
+            outcome_event_count = self._conn.execute(
+                "SELECT COUNT(*) FROM outcome_events"
+            ).fetchone()[0]
+            schema_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             return {
                 "db_path": str(self.db_path),
                 "decisions": decision_count,
                 "by_source": by_source,
                 "outcomes_by_status": by_status,
                 "embeddings": embedding_count,
+                "outcome_events": outcome_event_count,
+                "schema_version": schema_version,
                 "embedding_coverage": (
                     embedding_count / decision_count if decision_count else 0.0
                 ),
@@ -526,6 +852,7 @@ def build(db_path: Path = DEFAULT_DB_PATH) -> str:
     if not statistics:
         lines.append("- stats: unavailable (degraded)")
         return "\n".join(lines) + "\n"
+    lines.append(f"- schema version: {statistics['schema_version']}")
     lines.append(f"- decisions: {statistics['decisions']}")
     for source, count in sorted(statistics["by_source"].items()):
         lines.append(f"  - {source}: {count}")
@@ -538,6 +865,7 @@ def build(db_path: Path = DEFAULT_DB_PATH) -> str:
         f"- embeddings: {statistics['embeddings']} "
         f"(coverage {statistics['embedding_coverage']:.1%})"
     )
+    lines.append(f"- immutable outcome events: {statistics['outcome_events']}")
     return "\n".join(lines) + "\n"
 
 

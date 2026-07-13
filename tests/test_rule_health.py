@@ -64,6 +64,32 @@ def test_went_hard_signal():
     assert not rule_health.went_hard(0, None, None)
 
 
+def test_rule_health_prefers_verifier_evidence_without_overreading_frontier_pass(
+    tmp_path,
+):
+    db = tmp_path / "verified.db"
+    _seed(db, [
+        {"features": {"verb_class": "fix"}, "hard": True},
+        {"features": {"verb_class": "fix"}, "hard": False},
+        {"features": {"verb_class": "fix"}, "hard": True},
+        {"features": {"verb_class": "fix"}, "hard": False},
+    ])
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE outcomes SET verified_success=1 WHERE route_id='r0'")
+    conn.execute("UPDATE outcomes SET verified_success=0 WHERE route_id='r1'")
+    conn.execute("UPDATE outcomes SET verified_success=1 WHERE route_id='r2'")
+    conn.execute("UPDATE decisions SET rung='frontier' WHERE route_id='r2'")
+    conn.execute(
+        "UPDATE outcomes SET verified_success=0, "
+        "verification_failure_cause='policy_constraint' WHERE route_id='r3'")
+    conn.commit()
+    conn.close()
+
+    pool = rule_health._load_pool(db, source=None)
+
+    assert [hard for _, hard in pool] == [False, True, True, False]
+
+
 def test_base_rate_and_lift(tmp_path):
     db = tmp_path / "m.db"
     # 100 turns, 20 hard -> base rate 20%. verb:fix fires on 30, of which 18 hard.

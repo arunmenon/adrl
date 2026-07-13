@@ -120,6 +120,19 @@ def test_tier_only_trivial_derives_needs_frontier_false():
     assert verdict.score == 0.15
 
 
+def test_contradictory_frontier_flag_is_normalized_from_tier():
+    hard = classify_intent_llm(
+        "refactor everything",
+        _sender=_sender_returning('{"tier":"hard","needs_frontier":false}'),
+    )
+    easy = classify_intent_llm(
+        "fix typo",
+        _sender=_sender_returning('{"tier":"trivial","needs_frontier":true}'),
+    )
+    assert hard is not None and hard.needs_frontier is True
+    assert easy is not None and easy.needs_frontier is False
+
+
 # ── garbage / empty body -> None ─────────────────────────────────────────────
 
 def test_garbage_body_returns_none():

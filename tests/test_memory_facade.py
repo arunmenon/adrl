@@ -15,6 +15,7 @@ mandatory nomic embedding prefixes.
 from __future__ import annotations
 
 import hashlib
+import json
 
 from router.features import extract
 from router.memory_facade import (
@@ -25,7 +26,7 @@ from router.memory_facade import (
     build,
 )
 from router.memory_null import NullProvider
-from router.memory_ports import OutcomeEvent
+from router.memory_ports import OutcomeEvent, VerifiedOutcome
 from router.policy import Route
 
 
@@ -38,6 +39,7 @@ class SpyProvider:
     def __init__(self):
         self.decisions = []          # (DecisionEvent, embedding)
         self.outcomes = []           # (route_id, OutcomeEvent)
+        self.verifications = []      # (route_id, VerifiedOutcome, event metadata)
         self.finalized = []          # (session_id, prev_interrupted, prev_retried)
 
     def record_decision(self, decision, embedding=None):
@@ -46,6 +48,12 @@ class SpyProvider:
 
     def attach_outcome(self, route_id, outcome):
         self.outcomes.append((route_id, outcome))
+        return True
+
+    def attach_verification(self, route_id, verification, *, event_id=None,
+                            observed_at=None):
+        self.verifications.append(
+            (route_id, verification, event_id, observed_at))
         return True
 
     def finalize_turn(self, session_id, *, prev_interrupted, prev_retried):
@@ -70,6 +78,7 @@ class HostileProvider:
 
     record_decision = _boom
     attach_outcome = _boom
+    attach_verification = _boom
     finalize_turn = _boom
     similar_turns = _boom
     stats = _boom
@@ -143,6 +152,22 @@ def test_features_json_never_contains_instruction_text():
     assert '"verb_class"' in event.features_json  # features themselves survive
 
 
+def test_decision_trace_is_allowlisted_and_text_free():
+    memory = RouterMemory([NullProvider()])
+    text = "private implementation detail xyzzy42"
+    event, _ = memory.make_decision_event(
+        text, extract(text), _route(), session_id="s-trace",
+        decision_trace={
+            "resolver": "llm_classifier", "tier": "standard",
+            "instruction_text": text, "reason": "echo xyzzy42",
+        },
+    )
+    assert json.loads(event.trace_json) == {
+        "resolver": "llm_classifier", "tier": "standard",
+    }
+    assert "xyzzy42" not in event.trace_json
+
+
 def test_record_drops_embedding_for_sha_less_decisions():
     spy = SpyProvider()
     memory = RouterMemory([spy])
@@ -165,6 +190,8 @@ def test_hostile_provider_is_absorbed_by_null_terminal():
 
     assert memory.record_decision(event) == event.route_id
     assert memory.attach_outcome(event.route_id, OutcomeEvent()) is True
+    assert memory.attach_verification(
+        event.route_id, VerifiedOutcome(task_success=True)) is True
     assert memory.finalize_turn("s-6") == 0
     assert memory.similar_turns([0.0] * 8) == []
     assert memory.stats() == {"provider": "null"}
@@ -175,6 +202,8 @@ def test_hostile_provider_is_absorbed_by_null_terminal():
 def test_facade_methods_survive_garbage_without_raising():
     memory = RouterMemory([HostileProvider(), NullProvider()])
     assert memory.attach_outcome("", OutcomeEvent()) is False
+    assert memory.attach_verification(
+        "", VerifiedOutcome(task_success=True)) is False
     assert memory.finalize_turn(None) == 0
     assert memory.similar_turns(None) == []
     assert memory.record_decision(None) is None
@@ -222,6 +251,11 @@ def test_recorder_three_call_flow():
     assert route_id == recorder.active_route_id("sess-A")
     assert recorder.attach("sess-A", OutcomeEvent(status="closed_turn")) is True
     assert spy.outcomes[0][0] == route_id
+    verification = VerifiedOutcome(
+        task_success=True, verifier_source="pytest", verified_at=123.0)
+    assert recorder.verify(
+        "sess-A", verification, event_id="verify-1", observed_at=124.0)
+    assert spy.verifications == [(route_id, verification, "verify-1", 124.0)]
 
     # turn N+1 in the same session: a NEW route_id is minted and remembered
     route_id_2 = recorder.record("next thing", extract("next thing"),
@@ -247,6 +281,8 @@ def test_recorder_pinned_turn_records_without_embedding():
 def test_recorder_attach_without_active_route_is_false():
     recorder = RoutingRecorder(RouterMemory([NullProvider()]))
     assert recorder.attach("never-seen-session", OutcomeEvent()) is False
+    assert recorder.verify(
+        "never-seen-session", VerifiedOutcome(task_success=True)) is False
 
 
 # ── report ────────────────────────────────────────────────────────────────────

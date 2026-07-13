@@ -19,6 +19,7 @@ from router.live_router import (
     LiveRouter,
     RoutePlan,
 )
+from router.health import RungHealthMonitor
 from router.state import DictSessionStore
 
 
@@ -111,6 +112,45 @@ def test_user_turn_easy_routes_local_with_anthropic_fallback():
     assert plan.fallback_model is None          # original body on fail-open
     assert plan.fallback_upstream == ANTHROPIC
     assert router._normalize_rung(plan.rung) == "local"
+
+
+def test_privacy_pinned_user_turn_has_no_cloud_fallback():
+    store = DictSessionStore()
+    store.pin_privacy("private")
+    router = LiveRouter(store=store)
+    plan = router.plan(
+        "POST", "/v1/messages",
+        _user_body("fix the typo", session_id="private"),
+    )
+    assert plan.privacy_pinned is True
+    assert plan.primary_upstream == LITELLM
+    assert plan.fallback_upstream is None
+
+
+def test_privacy_pinned_continuation_returns_to_local_without_cloud_fallback():
+    store = DictSessionStore()
+    store.set_route("private-cont", "frontier")
+    store.pin_privacy("private-cont")
+    router = LiveRouter(store=store)
+    plan = router.plan("POST", "/v1/messages", _continuation_body("private-cont"))
+    assert plan.layer == "gate:privacy"
+    assert plan.primary_upstream == LITELLM
+    assert plan.fallback_upstream is None
+    assert store.get_session("private-cont").route == "local-code"
+
+
+def test_privacy_pinned_oversized_context_is_blocked_without_upstream():
+    store = DictSessionStore()
+    store.pin_privacy("private-large")
+    router = LiveRouter(store=store)
+    plan = router.plan(
+        "POST", "/v1/messages",
+        _user_body("x" * 110_000, session_id="private-large"),
+    )
+    assert plan.rung == "blocked"
+    assert plan.blocked_reason
+    assert plan.primary_upstream == ""
+    assert plan.fallback_upstream is None
 
 
 def test_user_turn_hard_routes_frontier_passthrough():
@@ -263,6 +303,27 @@ def test_user_turn_records_decision_with_route_id():
     assert "decision_ms" in kwargs
 
 
+def test_classifier_provenance_is_recorded_with_decision():
+    recorder = _FakeRecorder()
+    router = LiveRouter(
+        store=DictSessionStore(), memory=recorder, classifier=_classifier_local)
+    router.plan(
+        "POST", "/v1/messages", _user_body("wire up the new endpoint"))
+    _, _, route, kwargs = recorder.records[0]
+    assert route.layer == "classifier"
+    assert kwargs["classifier_tier"] == "standard"
+    assert kwargs["propensity"] == "classifier"
+    assert kwargs["classifier_ms"] >= 0.0
+    assert kwargs["decision_trace"] == {
+        "resolver": "llm_classifier",
+        "called": True,
+        "abstained": False,
+        "tier": "standard",
+        "needs_frontier": False,
+        "score": None,
+    }
+
+
 def test_recorder_failure_does_not_break_plan():
     class _BadRecorder:
         def new_turn(self, sid, **kw):
@@ -350,3 +411,51 @@ def test_user_turn_increments_turn_counter():
     assert store.get_session("t").turn_count == 1
     router.plan("POST", "/v1/messages", _user_body("add a test", session_id="t"))
     assert store.get_session("t").turn_count == 2
+
+
+def test_runtime_health_routes_around_unhealthy_local_rung():
+    monitor = RungHealthMonitor(cooldown_s=60)
+    monitor.record_failure("local", "timeout")
+    router = LiveRouter(store=DictSessionStore(), health=monitor)
+    plan = router.plan(
+        "POST", "/v1/messages",
+        _user_body("fix the README typo", session_id="health"),
+    )
+    assert plan.layer == "gate:feasibility"
+    assert plan.rung == "cheap_cloud"
+    assert plan.primary_model == CHEAP_CLOUD_MODEL
+
+
+def test_three_signal_episode_boundary_releases_hysteresis():
+    store = DictSessionStore()
+    store.set_route("episode", "frontier")
+    store.mark_escalated("episode")
+    store.record_episode_intent("episode", "hard", ("src/auth.py",))
+    store.mark_turn_clean("episode", True)
+    router = LiveRouter(store=store)
+    plan = router.plan(
+        "POST", "/v1/messages",
+        _user_body(
+            "great, that's done. now write README.md",
+            session_id="episode",
+        ),
+    )
+    assert plan.rung == "local"
+    assert plan.layer == "heuristic"
+    state = store.get_session("episode")
+    assert state.escalated_this_episode is False
+    assert state.episode_index == 1
+
+
+def test_uncertain_episode_boundary_keeps_frontier_hysteresis():
+    store = DictSessionStore()
+    store.set_route("episode-sticky", "frontier")
+    store.mark_escalated("episode-sticky")
+    store.record_episode_intent("episode-sticky", "hard")
+    router = LiveRouter(store=store)
+    plan = router.plan(
+        "POST", "/v1/messages",
+        _user_body("that's done, continue", session_id="episode-sticky"),
+    )
+    assert plan.rung == "frontier"
+    assert plan.layer == "gate:hysteresis"

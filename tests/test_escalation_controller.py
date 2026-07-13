@@ -20,9 +20,12 @@ def test_two_edit_fails_escalate_local_to_cloud():
     # strike 1: no escalation yet
     d = ec.observe_tool_results("s1", [EDIT_FAIL])
     assert not d.escalate and ec.current_route("s1") == "local-code"
+    # Partial evidence is mirrored before the threshold fires.
+    assert store.get_session("s1").strikes["edit"] == 1
     # strike 2: edit-apply trip-wire fires -> escalate to cheap-cloud, sticky
     d = ec.observe_tool_results("s1", [EDIT_FAIL])
     assert d.escalate and d.to_rung == "cheap-cloud" and d.tripwire == "edit_apply"
+    assert d.tripwire_type == "dialect"
     assert ec.current_route("s1") == "cheap-cloud"          # route flipped
     assert store.get_session("s1").escalated_this_episode   # hysteresis
 
@@ -34,6 +37,11 @@ def test_escalation_is_sticky():
     ec.new_turn("s2")
     ec.observe_tool_results("s2", [EDIT_FAIL])
     ec.observe_tool_results("s2", [EDIT_FAIL])
+    assert ec.current_route("s2") == "cheap-cloud"
+    # Observing another response while the hit remains latched does not climb
+    # cheap-cloud -> frontier in the same turn.
+    d = ec.observe_response("s2", [{"type": "text", "text": "continuing"}])
+    assert not d.escalate
     assert ec.current_route("s2") == "cheap-cloud"
     # a subsequent clean turn stays escalated (episode hysteresis)
     ec.new_turn("s2")
@@ -71,3 +79,24 @@ def test_isolation_between_sessions():
     ec.observe_tool_results("a", [EDIT_FAIL])
     assert ec.current_route("a") == "cheap-cloud"
     assert ec.current_route("b") == "local-code"   # b unaffected
+
+
+def test_snapshot_carries_cumulative_errors_and_continuations():
+    store = DictSessionStore()
+    ec = EscalationController(store)
+    ec.new_turn("evidence")
+    ec.note_continuation("evidence")
+    ec.observe_tool_results("evidence", [
+        {"type": "tool_result", "is_error": True, "content": "pytest failed"},
+        EDIT_FAIL,
+    ])
+    snap = ec.snapshot("evidence")
+    assert snap.error_results == 2
+    assert snap.edit_failures == 1
+    assert snap.continuation_count == 1
+    assert snap.strikes["edit"] == 1
+
+    ec.new_turn("evidence")
+    reset = ec.snapshot("evidence")
+    assert reset.error_results == 0
+    assert reset.continuation_count == 0

@@ -17,6 +17,7 @@ method's docstring names the Redis command it maps to so that swap is mechanical
     reset_strikes    DEL     session:{id}:strikes             (per turn)
     pin_privacy      HSET    session:{id} privacy_pinned 1     (one-way)
     mark_escalated   HSET    session:{id} escalated 1
+    start_new_episode HSET   session:{id} route/escalated/episode metadata
     incr_turn        HINCRBY session:{id} turn_count 1
     touch            EXPIRE  session:{id} 14400               (refresh TTL)
     expire_idle      (no-op — Redis TTL evicts automatically; see method doc)
@@ -77,8 +78,20 @@ class SessionStore(ABC):
         """Atomically increment the `kind` trip-wire counter; return new count."""
 
     @abstractmethod
+    def set_strikes(self, sid: str, strikes: dict[str, int]) -> None:
+        """Replace the per-turn strike snapshot with canonical evaluator counts."""
+
+    @abstractmethod
     def reset_strikes(self, sid: str) -> None:
         """Clear all trip-wire counters (called per turn boundary)."""
+
+    @abstractmethod
+    def incr_continuation(self, sid: str) -> int:
+        """Increment this turn's continuation count; return the new count."""
+
+    @abstractmethod
+    def reset_continuations(self, sid: str) -> None:
+        """Reset this turn's continuation count at a new user-turn boundary."""
 
     @abstractmethod
     def pin_privacy(self, sid: str) -> None:
@@ -87,6 +100,19 @@ class SessionStore(ABC):
     @abstractmethod
     def mark_escalated(self, sid: str) -> None:
         """Set `escalated_this_episode` (hysteresis gate, §5.3)."""
+
+    @abstractmethod
+    def start_new_episode(self, sid: str) -> SessionState:
+        """Release escalation hysteresis while preserving the privacy pin."""
+
+    @abstractmethod
+    def record_episode_intent(self, sid: str, verb_class: str,
+                              files: tuple[str, ...] = ()) -> None:
+        """Record local boundary signals without retaining raw instruction text."""
+
+    @abstractmethod
+    def mark_turn_clean(self, sid: str, clean: bool) -> None:
+        """Record whether the most recent turn ended without failure evidence."""
 
     @abstractmethod
     def incr_turn(self, sid: str) -> int:
@@ -160,10 +186,32 @@ class DictSessionStore(SessionStore):
             self._last_touch[sid] = time.time()
             return state.strikes[kind]
 
+    def set_strikes(self, sid: str, strikes: dict[str, int]) -> None:
+        with self._lock:
+            state = self.get_session(sid)
+            state.strikes = {
+                str(kind): max(0, int(value or 0))
+                for kind, value in dict(strikes or {}).items()
+            }
+            self._last_touch[sid] = time.time()
+
     def reset_strikes(self, sid: str) -> None:
         with self._lock:
             state = self.get_session(sid)
             state.strikes.clear()
+            self._last_touch[sid] = time.time()
+
+    def incr_continuation(self, sid: str) -> int:
+        with self._lock:
+            state = self.get_session(sid)
+            state.continuation_count += 1
+            self._last_touch[sid] = time.time()
+            return state.continuation_count
+
+    def reset_continuations(self, sid: str) -> None:
+        with self._lock:
+            state = self.get_session(sid)
+            state.continuation_count = 0
             self._last_touch[sid] = time.time()
 
     def pin_privacy(self, sid: str) -> None:
@@ -177,6 +225,34 @@ class DictSessionStore(SessionStore):
         with self._lock:
             state = self.get_session(sid)
             state.escalated_this_episode = True
+            self._last_touch[sid] = time.time()
+
+    def start_new_episode(self, sid: str) -> SessionState:
+        with self._lock:
+            state = self.get_session(sid)
+            state.route = "local"
+            state.escalated_this_episode = False
+            state.strikes.clear()
+            state.continuation_count = 0
+            state.episode_index += 1
+            state.episode_verb_class = ""
+            state.episode_files = ()
+            state.last_turn_clean = False
+            self._last_touch[sid] = time.time()
+            return state
+
+    def record_episode_intent(self, sid: str, verb_class: str,
+                              files: tuple[str, ...] = ()) -> None:
+        with self._lock:
+            state = self.get_session(sid)
+            state.episode_verb_class = str(verb_class or "")
+            state.episode_files = tuple(sorted(set(state.episode_files) | set(files)))
+            self._last_touch[sid] = time.time()
+
+    def mark_turn_clean(self, sid: str, clean: bool) -> None:
+        with self._lock:
+            state = self.get_session(sid)
+            state.last_turn_clean = bool(clean)
             self._last_touch[sid] = time.time()
 
     def incr_turn(self, sid: str) -> int:

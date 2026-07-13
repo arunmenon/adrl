@@ -15,7 +15,13 @@ from __future__ import annotations
 import pytest
 
 from router.memory_null import NullProvider
-from router.memory_ports import DecisionEvent, MemoryProvider, NeighborTurn, OutcomeEvent
+from router.memory_ports import (
+    DecisionEvent,
+    MemoryProvider,
+    NeighborTurn,
+    OutcomeEvent,
+    VerifiedOutcome,
+)
 
 PROVIDER_PARAMS = ["null", "sqlite"]
 
@@ -72,6 +78,13 @@ def test_record_attach_finalize_round_trip(provider):
     attached = provider.attach_outcome(decision.route_id, _outcome())
     assert attached is True
 
+    verified = provider.attach_verification(
+        decision.route_id,
+        VerifiedOutcome(task_success=True, verifier_source="contract"),
+        event_id="contract-verification",
+    )
+    assert verified is True
+
     finalized = provider.finalize_turn(
         decision.session_id, prev_interrupted=False, prev_retried=False)
     assert isinstance(finalized, int)
@@ -109,6 +122,8 @@ def test_attach_to_unknown_route_id_is_bool(provider):
     lambda p: p.record_decision(_decision(), embedding="not-a-vector"),
     lambda p: p.attach_outcome(None, None),
     lambda p: p.attach_outcome(12345, object()),
+    lambda p: p.attach_verification(None, None),
+    lambda p: p.attach_verification(12345, object()),
     lambda p: p.finalize_turn(None, prev_interrupted=False, prev_retried=False),
     lambda p: p.similar_turns(None),
     lambda p: p.similar_turns("garbage", k=-3),

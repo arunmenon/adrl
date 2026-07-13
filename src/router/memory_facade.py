@@ -44,9 +44,14 @@ from .memory_ports import (
     DecisionEvent,
     NeighborTurn,
     OutcomeEvent,
+    VerifiedOutcome,
 )
 
 DEFAULT_POLICY_VERSION = "v1"
+_TRACE_FIELDS = {
+    "resolver", "called", "abstained", "tier", "needs_frontier", "score",
+    "confidence", "n_neighbors", "candidate_pool", "model_version",
+}
 
 
 def default_providers() -> list:
@@ -104,6 +109,17 @@ class RouterMemory:
         except Exception:
             return "{}"
 
+    @staticmethod
+    def _trace_json(trace: Optional[dict]) -> str:
+        """Serialize only approved resolver metadata, never free-form text."""
+        if not isinstance(trace, dict):
+            return "{}"
+        scrubbed = {key: trace[key] for key in _TRACE_FIELDS if key in trace}
+        try:
+            return json.dumps(scrubbed, default=str, sort_keys=True)
+        except Exception:
+            return "{}"
+
     def make_decision_event(self, instruction_text: str, features: Any, route: Any,
                             *, session_id: str, turn_index: int = 0,
                             source: str = "organic",
@@ -112,6 +128,7 @@ class RouterMemory:
                             propensity: Optional[str] = None,
                             classifier_ms: float = 0.0,
                             decision_ms: float = 0.0,
+                            decision_trace: Optional[dict] = None,
                             ts: Optional[float] = None) -> tuple[DecisionEvent, bool]:
         """The privacy gate. Returns ``(event, embedding_allowed)``.
 
@@ -144,6 +161,7 @@ class RouterMemory:
             policy_version=self.policy_version,
             classifier_ms=float(classifier_ms),
             decision_ms=float(decision_ms),
+            trace_json=self._trace_json(decision_trace),
         )
         return event, not private
 
@@ -201,6 +219,27 @@ class RouterMemory:
             return False
         try:
             return bool(self._chain.attach_outcome(route_id, outcome))
+        except Exception:
+            return False
+
+    def attach_verification(
+        self,
+        route_id: str,
+        verification: VerifiedOutcome,
+        *,
+        event_id: Optional[str] = None,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Append verifier evidence without rewriting the operational outcome."""
+        if not route_id:
+            return False
+        try:
+            return bool(self._chain.attach_verification(
+                route_id,
+                verification,
+                event_id=event_id,
+                observed_at=observed_at,
+            ))
         except Exception:
             return False
 
@@ -271,6 +310,7 @@ class RoutingRecorder:
                classifier_tier: Optional[str] = None,
                propensity: Optional[str] = None,
                classifier_ms: float = 0.0, decision_ms: float = 0.0,
+               decision_trace: Optional[dict] = None,
                compute_embedding: bool = True) -> Optional[str]:
         """Mint a route_id, build the privacy-gated event, embed when allowed,
         store — and remember the route_id as this session's active turn."""
@@ -278,7 +318,8 @@ class RoutingRecorder:
             instruction_text, features, route, session_id=session_id,
             turn_index=turn_index, source=source,
             classifier_tier=classifier_tier, propensity=propensity,
-            classifier_ms=classifier_ms, decision_ms=decision_ms)
+            classifier_ms=classifier_ms, decision_ms=decision_ms,
+            decision_trace=decision_trace)
         embedding = (self.memory.embed_document(instruction_text)
                      if (embedding_allowed and compute_embedding) else None)
         stored = self.memory.record_decision(event, embedding)
@@ -291,6 +332,25 @@ class RoutingRecorder:
         if not route_id:
             return False
         return self.memory.attach_outcome(route_id, outcome)
+
+    def verify(
+        self,
+        session_id: str,
+        verification: VerifiedOutcome,
+        *,
+        event_id: Optional[str] = None,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Attach late verification to the session's active route."""
+        route_id = self._active_route.get(session_id)
+        if not route_id:
+            return False
+        return self.memory.attach_verification(
+            route_id,
+            verification,
+            event_id=event_id,
+            observed_at=observed_at,
+        )
 
     def active_route_id(self, session_id: str) -> Optional[str]:
         return self._active_route.get(session_id)

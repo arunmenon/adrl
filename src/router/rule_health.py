@@ -28,9 +28,9 @@ HOW IT WORKS (read-only over the WS1 ledger):
       - leaning is judged by the policy's routing bands, so the middle-band verbs
         (small_edit, write, fix, unknown) are NEUTRAL and only reported, never
         flagged: the heuristic never routes them easy or hard in the first place.
-  * "went hard" is ``outcomes.went_hard``: an escalation fired, ``user_retried``,
-    or ``outcome_proxy_hard`` - the SAME label WS4 and the shadow harness use.
-    Only ``closed_*`` outcomes are counted; a still-open turn has no verdict yet.
+  * Hardness uses ``outcomes.effective_task_hard``: v2's cause-clean task signal
+    where present, with the legacy aggregate only for old rows. It is the SAME
+    label WS4 and the shadow harness use. Only ``closed_*`` outcomes are counted.
 
 Demotion is a HUMAN decision in v1: this reporter only flags candidates (a rule
 firing rarely, or with the wrong-signed lift past a threshold on a large enough
@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from router.features import CONTEXT_TOKEN_THRESHOLD
-from router.outcomes import went_hard
+from router.outcomes import effective_task_hard, went_hard
 
 DEFAULT_DB_PATH = Path("data/router-memory.db")
 
@@ -154,8 +154,25 @@ def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
     except Exception:
         return []
     try:
+        outcome_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(outcomes)")
+        }
+        task_signal_expr = (
+            "o.task_signal_hard" if "task_signal_hard" in outcome_columns
+            else "NULL"
+        )
+        verified_expr = (
+            "o.verified_success" if "verified_success" in outcome_columns
+            else "NULL"
+        )
+        verification_cause_expr = (
+            "o.verification_failure_cause"
+            if "verification_failure_cause" in outcome_columns else "NULL"
+        )
         query = (
-            "SELECT d.features_json, o.escalated, o.user_retried, o.outcome_proxy_hard "
+            "SELECT d.features_json, d.rung, o.escalated, o.user_retried, "
+            f"o.outcome_proxy_hard, {task_signal_expr}, {verified_expr}, "
+            f"{verification_cause_expr} "
             "FROM decisions d JOIN outcomes o ON o.route_id = d.route_id "
             "WHERE o.status IN ('closed_turn', 'closed_final')"
         )
@@ -172,14 +189,17 @@ def _load_pool(db_path: Path, source: Optional[str]) -> list[tuple[dict, bool]]:
         conn.close()
 
     pool: list[tuple[dict, bool]] = []
-    for features_json, escalated, user_retried, proxy_hard in rows:
+    for (features_json, rung, escalated, user_retried, proxy_hard, task_hard,
+         verified_success, verification_failure_cause) in rows:
         try:
             features = json.loads(features_json) if features_json else {}
             if not isinstance(features, dict):
                 features = {}
         except Exception:
             features = {}
-        pool.append((features, went_hard(escalated, user_retried, proxy_hard)))
+        pool.append((features, effective_task_hard(
+            task_hard, escalated, user_retried, proxy_hard,
+            verified_success, rung, verification_failure_cause)))
     return pool
 
 

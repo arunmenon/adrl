@@ -40,6 +40,11 @@ class SessionState:
     escalated_this_episode: bool = False
     turn_count: int = 0
     strikes: dict = field(default_factory=dict)
+    continuation_count: int = 0
+    episode_index: int = 0
+    episode_verb_class: str = ""
+    episode_files: tuple[str, ...] = ()
+    last_turn_clean: bool = False
 
 
 @dataclass
@@ -123,11 +128,16 @@ def route_turn(f: TurnFeatures, session: SessionState,
     if classifier is not None and f.instruction_text:
         verdict = classifier(f.instruction_text)   # fail-safe: None on any failure
         if verdict is not None:
-            if getattr(verdict, "needs_frontier", False):
+            tier = str(getattr(verdict, "tier", "") or "").lower()
+            needs_frontier = (
+                tier == "hard" if tier in {"trivial", "standard", "hard"}
+                else bool(getattr(verdict, "needs_frontier", False))
+            )
+            if needs_frontier:
                 return Route("frontier", cascade=False, layer="classifier", score=s,
-                             reason=f"classifier: {getattr(verdict, 'tier', '?')} -> frontier")
+                             reason=f"classifier: {tier or '?'} -> frontier")
             return Route("local", cascade=True, layer="classifier", score=s,
-                         reason=f"classifier: {getattr(verdict, 'tier', '?')} -> local w/ trip-wires")
+                         reason=f"classifier: {tier or '?'} -> local w/ trip-wires")
 
     # Fallback when no classifier is wired, or it abstained (None): Phase-3 stub.
     return Route("local", cascade=True, layer="middle_default", score=s,

@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from .memory_ports import NeighborTurn
-from .outcomes import went_hard
+from .outcomes import effective_task_hard
 
 # ── shared knobs (shadow harness imports these so live == evaluated) ──────────
 K = 12
@@ -97,12 +97,16 @@ def recency_weight(ts: float, now: float, halflife_s: float = RECENCY_HALFLIFE_S
 
 
 def neighbor_went_hard(neighbor: NeighborTurn) -> bool:
-    """A neighbor 'needed frontier' if it went hard by the shared three-signal
-    label (escalation, user retry, or friction proxy). NeighborTurn now carries
-    ``user_retried``, so the vote scores neighbors by the SAME definition the
-    ground truth uses (was previously a two-signal copy that biased recall)."""
-    return went_hard(neighbor.escalated, neighbor.user_retried,
-                     neighbor.outcome_proxy_hard)
+    """Use the cause-clean task signal, with legacy fallback for pre-v2 rows."""
+    return effective_task_hard(
+        neighbor.task_signal_hard,
+        neighbor.escalated,
+        neighbor.user_retried,
+        neighbor.outcome_proxy_hard,
+        neighbor.verified_success,
+        neighbor.rung,
+        neighbor.verification_failure_cause,
+    )
 
 
 def passes_filter(neighbor: NeighborTurn, *, query_source: str,

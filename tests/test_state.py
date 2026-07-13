@@ -44,6 +44,7 @@ def test_unknown_session_auto_creates(store):
     assert state.escalated_this_episode is False
     assert state.turn_count == 0
     assert state.strikes == {}
+    assert state.continuation_count == 0
 
 
 def test_get_session_is_stable_same_object(store):
@@ -106,6 +107,21 @@ def test_reset_strikes_does_not_touch_route_or_pin(store):
     state = store.get_session("s_4")
     assert state.route == "frontier"
     assert state.privacy_pinned is True
+
+
+def test_set_strikes_replaces_with_canonical_snapshot(store):
+    store.incr_strike("s_sync", "edit")
+    store.set_strikes("s_sync", {"parse": 1, "edit": 2, "loop": 0})
+    assert store.get_session("s_sync").strikes == {
+        "parse": 1, "edit": 2, "loop": 0,
+    }
+
+
+def test_continuation_count_is_per_turn(store):
+    assert store.incr_continuation("s_cont") == 1
+    assert store.incr_continuation("s_cont") == 2
+    store.reset_continuations("s_cont")
+    assert store.get_session("s_cont").continuation_count == 0
 
 
 def test_incr_strike_atomic_under_threads(store):
@@ -197,6 +213,24 @@ def test_start_fresh_session_resets_everything(store):
     assert fresh.strikes == {}
     assert fresh.escalated_this_episode is False
     assert fresh.turn_count == 0
+
+
+def test_new_episode_releases_hysteresis_but_preserves_session_and_privacy(store):
+    store.pin_privacy("episode")
+    store.set_route("episode", "frontier")
+    store.mark_escalated("episode")
+    store.incr_turn("episode")
+    store.record_episode_intent("episode", "hard", ("src/auth.py",))
+    store.mark_turn_clean("episode", True)
+    state = store.start_new_episode("episode")
+    assert state.route == "local"
+    assert state.escalated_this_episode is False
+    assert state.privacy_pinned is True
+    assert state.turn_count == 1
+    assert state.episode_index == 1
+    assert state.episode_verb_class == ""
+    assert state.episode_files == ()
+    assert state.last_turn_clean is False
 
 
 # ── touch / expire: documented no-op-now hook ──────────────────────────────

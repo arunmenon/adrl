@@ -21,10 +21,9 @@ Crucially it drives the REAL memory pipeline rather than a hand-rolled copy:
     live resolver uses;
   * the global ``MIN_FINALIZED`` cold-start gate is enforced, so no metric is
     reported for a memory regime where the live resolver abstains on everything;
-  * the ground-truth "went hard" label is ``outcomes.went_hard`` - the SAME
-    three-signal definition the neighbor vote now uses (NeighborTurn carries
-    user_retried), so the vote is never scored against a stricter label than it
-    votes on.
+  * the target and neighbor use ``outcomes.effective_task_hard``: v2's
+    cause-clean task signal when present, with the legacy aggregate only for
+    pre-v2 rows. The vote and its evaluation therefore use the same label.
 
 GRADUATION GATE (plan): the retrieval layer is wired live only when, over a
 sufficient number of ACTUALLY-EVALUATED (non-abstained) middle-band decisions,
@@ -51,7 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 from router.memory_sqlite import SqliteProvider
-from router.outcomes import went_hard
+from router.outcomes import effective_task_hard
 from router.retrieval_router import (
     GRADUATION_MIN_MIDDLE,
     K,
@@ -75,18 +74,32 @@ class _Target:
     escalated: bool
     user_retried: Optional[bool]
     proxy_hard: Optional[bool]
+    task_signal_hard: Optional[bool]
+    rung: str
+    verified_success: Optional[bool]
+    verification_failure_cause: Optional[str]
 
     @property
     def actual_hard(self) -> bool:
-        return went_hard(self.escalated, self.user_retried, self.proxy_hard)
+        return effective_task_hard(
+            self.task_signal_hard,
+            self.escalated,
+            self.user_retried,
+            self.proxy_hard,
+            self.verified_success,
+            self.rung,
+            self.verification_failure_cause,
+        )
 
 
 def _load_targets(conn: sqlite3.Connection) -> list[_Target]:
     """Middle-band, closed decisions that carry an embedding. [] on any error."""
     try:
         rows = conn.execute(
-            "SELECT d.route_id, d.session_id, d.source, d.ts, "
-            "o.escalated, o.user_retried, o.outcome_proxy_hard "
+            "SELECT d.route_id, d.session_id, d.source, d.ts, d.rung, "
+            "o.escalated, o.user_retried, o.outcome_proxy_hard, "
+            "o.task_signal_hard, o.verified_success, "
+            "o.verification_failure_cause "
             "FROM decisions d "
             "JOIN outcomes o ON o.route_id = d.route_id "
             "JOIN embeddings e ON e.route_id = d.route_id "
@@ -98,13 +111,20 @@ def _load_targets(conn: sqlite3.Connection) -> list[_Target]:
     except Exception:
         return []
     targets: list[_Target] = []
-    for route_id, session_id, source, ts, escalated, user_retried, proxy_hard in rows:
+    for (route_id, session_id, source, ts, rung, escalated, user_retried,
+         proxy_hard, task_hard, verified_success,
+         verification_failure_cause) in rows:
         targets.append(_Target(
             route_id=route_id, session_id=session_id, source=source,
             ts=float(ts or 0.0),
             escalated=bool(escalated),
             user_retried=None if user_retried is None else bool(user_retried),
-            proxy_hard=None if proxy_hard is None else bool(proxy_hard)))
+            proxy_hard=None if proxy_hard is None else bool(proxy_hard),
+            task_signal_hard=None if task_hard is None else bool(task_hard),
+            rung=str(rung or ""),
+            verified_success=(None if verified_success is None
+                              else bool(verified_success)),
+            verification_failure_cause=verification_failure_cause))
     return targets
 
 

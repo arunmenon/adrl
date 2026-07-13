@@ -43,8 +43,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import discriminator
+from .episode import detect_episode_boundary, file_references
 from .features import extract
-from .policy import route_turn
+from .policy import CONTEXT_HEADROOM, REGISTRY, route_turn
 from .state import DictSessionStore, SessionStore
 
 DEFAULT_LITELLM_URL = "http://localhost:4001"
@@ -113,6 +114,8 @@ class RoutePlan:
     label: str
     route_id: str | None
     layer: str
+    privacy_pinned: bool = False
+    blocked_reason: str | None = None
 
 
 def _last_user_text(body: dict) -> str:
@@ -199,6 +202,7 @@ class LiveRouter:
 
     def __init__(self, *, store: Optional[SessionStore] = None,
                  memory: Any = None, classifier: Any = None,
+                 health: Any = None,
                  litellm_url: str = DEFAULT_LITELLM_URL,
                  anthropic_url: str = DEFAULT_ANTHROPIC_URL,
                  policy_version: str = "v1",
@@ -208,6 +212,7 @@ class LiveRouter:
         self.store: SessionStore = store or DictSessionStore()
         self.memory = memory                    # RoutingRecorder | None
         self.classifier = classifier            # classify_intent_llm | None
+        self.health = health                    # RungHealthMonitor | compatible seam
         self.litellm_url = litellm_url
         self.anthropic_url = anthropic_url
         self.policy_version = policy_version
@@ -220,6 +225,15 @@ class LiveRouter:
 
     # ── dispatch primitives ──────────────────────────────────────────────────
 
+    def _registry(self) -> dict[str, dict]:
+        if self.health is None:
+            return REGISTRY
+        try:
+            registry = self.health.snapshot()
+            return registry if isinstance(registry, dict) else REGISTRY
+        except Exception:
+            return REGISTRY
+
     def _passthrough(self, *, label: str, layer: str = "passthrough") -> RoutePlan:
         """Anthropic relay, no rewrite, no fallback — the universal fail-safe."""
         return RoutePlan(
@@ -227,7 +241,9 @@ class LiveRouter:
             fallback_model=None, fallback_upstream=None,
             rung="passthrough", label=label, route_id=None, layer=layer)
 
-    def _dispatch(self, rung: str, *, label: str, layer: str) -> RoutePlan:
+    def _dispatch(self, rung: str, *, label: str, layer: str,
+                  allow_cloud_fallback: bool = True,
+                  privacy_pinned: bool = False) -> RoutePlan:
         """Map a rung (policy vocabulary 'local'|'cheap_cloud'|'frontier' OR the
         escalation store's 'local-code'|'local-small'|'cheap-cloud'|'frontier')
         to a concrete forward + fail-open plan."""
@@ -236,13 +252,17 @@ class LiveRouter:
             # Local execution on LiteLLM; fail open to the ORIGINAL body on Anthropic.
             return RoutePlan(
                 primary_model=LOCAL_CODE_MODEL, primary_upstream=self.litellm_url,
-                fallback_model=None, fallback_upstream=self.anthropic_url,
-                rung=rung, label=label, route_id=None, layer=layer)
+                fallback_model=None,
+                fallback_upstream=(self.anthropic_url if allow_cloud_fallback else None),
+                rung=rung, label=label, route_id=None, layer=layer,
+                privacy_pinned=privacy_pinned)
         if normalized == "local_small":
             return RoutePlan(
                 primary_model=LOCAL_SMALL_MODEL, primary_upstream=self.litellm_url,
-                fallback_model=None, fallback_upstream=self.anthropic_url,
-                rung=rung, label=label, route_id=None, layer=layer)
+                fallback_model=None,
+                fallback_upstream=(self.anthropic_url if allow_cloud_fallback else None),
+                rung=rung, label=label, route_id=None, layer=layer,
+                privacy_pinned=privacy_pinned)
         if normalized == "cheap_cloud":
             # Cloud on the client's subscription auth — model swap only, no
             # upstream change (no LiteLLM; its key is credit-less). Fail open to
@@ -261,6 +281,15 @@ class LiveRouter:
                 rung=rung, label=label, route_id=None, layer=layer)
         # Unknown rung -> safest thing is a plain passthrough.
         return self._passthrough(label=label, layer=layer)
+
+    def _blocked(self, *, label: str, layer: str, reason: str) -> RoutePlan:
+        """A policy conflict that must be surfaced without any upstream call."""
+        return RoutePlan(
+            primary_model=None, primary_upstream="",
+            fallback_model=None, fallback_upstream=None,
+            rung="blocked", label=label, route_id=None, layer=layer,
+            privacy_pinned=True, blocked_reason=reason,
+        )
 
     @staticmethod
     def _normalize_rung(rung: str) -> str:
@@ -298,6 +327,21 @@ class LiveRouter:
             # Stick to whatever rung the session is already on (default local);
             # do NOT re-run route_turn — the sticky route is cache-safe.
             session = self.store.get_session(session_id)
+            if session.privacy_pinned:
+                context_tokens = _estimate_context_tokens(body)
+                if context_tokens > CONTEXT_HEADROOM * REGISTRY["local"]["max_context"]:
+                    return self._blocked(
+                        label=label, layer="gate:pin_context_conflict",
+                        reason="privacy-pinned context exceeds local capacity",
+                    )
+                try:
+                    self.store.set_route(session_id, "local-code")
+                except Exception:
+                    pass
+                return self._dispatch(
+                    "local-code", label=label, layer="gate:privacy",
+                    allow_cloud_fallback=False, privacy_pinned=True,
+                )
             sticky = session.route or "local"
             return self._dispatch(sticky, label=label, layer="continuation")
 
@@ -319,17 +363,70 @@ class LiveRouter:
             privacy_pinned=session.privacy_pinned,
             escalated_this_episode=session.escalated_this_episode,
         )
+        boundary = detect_episode_boundary(features, session)
+        if session.escalated_this_episode and boundary.is_boundary:
+            try:
+                session = self.store.start_new_episode(session_id)
+                features = extract(
+                    instruction_text, context_tokens=context_tokens,
+                    turn_index=session.turn_count,
+                    prev_turn_interrupted=prev_interrupted,
+                    privacy_pinned=session.privacy_pinned,
+                    escalated_this_episode=False,
+                )
+            except Exception:
+                session = self.store.get_session(session_id)
+        classifier_ms = 0.0
+        classifier_tier = None
+        classifier_trace: dict[str, Any] = {"resolver": "none", "called": False}
+
+        def timed_classifier(text: str):
+            nonlocal classifier_ms, classifier_tier, classifier_trace
+            classifier_trace = {"resolver": "llm_classifier", "called": True}
+            classifier_started = time.perf_counter()
+            try:
+                verdict = self.classifier(text)
+            finally:
+                classifier_ms = (time.perf_counter() - classifier_started) * 1000.0
+            if verdict is None:
+                classifier_trace["abstained"] = True
+                return None
+            classifier_tier = str(getattr(verdict, "tier", "") or "") or None
+            classifier_trace.update({
+                "abstained": False,
+                "tier": classifier_tier,
+                "needs_frontier": bool(getattr(verdict, "needs_frontier", False)),
+                "score": getattr(verdict, "score", None),
+            })
+            return verdict
+
         started = time.perf_counter()
-        route = route_turn(features, session, classifier=self.classifier)
+        resolver = timed_classifier if self.classifier is not None else None
+        route = route_turn(
+            features, session, registry=self._registry(), classifier=resolver)
         decision_ms = (time.perf_counter() - started) * 1000.0
 
-        plan = self._dispatch(route.rung, label=label, layer=route.layer)
+        if route.conflict:
+            plan = self._blocked(label=label, layer=route.layer, reason=route.reason)
+        else:
+            plan = self._dispatch(
+                route.rung, label=label, layer=route.layer,
+                allow_cloud_fallback=not route.pinned,
+                privacy_pinned=route.pinned,
+            )
 
         # CRITICAL (review finding): persist the sticky route so this turn's
         # follow-up continuations stick to the chosen rung (not the default
         # local) and the escalation ladder can key off it. Store the dash-form.
         try:
             self.store.set_route(session_id, _STORE_RUNG.get(route.rung, route.rung))
+        except Exception:
+            pass
+        try:
+            self.store.record_episode_intent(
+                session_id, features.verb_class,
+                file_references(features.instruction_text),
+            )
         except Exception:
             pass
 
@@ -345,7 +442,9 @@ class LiveRouter:
                 route_id = self.memory.record(
                     instruction_text, features, route, session_id=session_id,
                     turn_index=session.turn_count, decision_ms=decision_ms,
-                    source=self.source,
+                    source=self.source, classifier_tier=classifier_tier,
+                    propensity=route.layer, classifier_ms=classifier_ms,
+                    decision_trace=classifier_trace,
                 )
                 plan.route_id = route_id
             except Exception:

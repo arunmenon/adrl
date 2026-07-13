@@ -743,6 +743,18 @@ ARCHETYPES = {
     "monorepo": _build_monorepo,
 }
 
+# Structured verifier commands. Keep ``test_cmd`` above for the existing human
+# runner, but counterfactual execution never invokes a shell string.
+STRUCTURED_TEST_COMMANDS = {
+    "python_cli": ({"name": "pytest", "argv": ("python", "-m", "pytest", "-q"), "cwd": "."},),
+    "nextjs_ts": ({"name": "vitest", "argv": ("npm", "test"), "cwd": "."},),
+    "terraform": ({"name": "terraform_validate", "argv": ("terraform", "validate"), "cwd": "."},),
+    "sql_prisma": ({"name": "prisma_validate", "argv": ("prisma", "validate"), "cwd": "."},),
+    "docs": ({"name": "mkdocs", "argv": ("mkdocs", "build", "--strict"), "cwd": "."},),
+    "monorepo": ({"name": "api_pytest", "argv": ("python", "-m", "pytest", "-q"),
+                  "cwd": "services/api"},),
+}
+
 
 def _pick_archetype(rng: random.Random) -> str:
     keys = list(ARCHETYPE_WEIGHTS)
@@ -801,6 +813,7 @@ def make_sandbox(
         "heavy": bool(heavy),
         "planted_secret": bool(plant_secret),
         "context_tokens_estimate": _estimate_tokens(proj),
+        "test_commands": [dict(command) for command in STRUCTURED_TEST_COMMANDS[arch]],
     }
     sb.update(extra)  # project, bad_var, good_var, language, dominant_ext, test_cmd, planted_issue
     return sb

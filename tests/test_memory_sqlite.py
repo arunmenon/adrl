@@ -18,8 +18,10 @@ from router.memory_sqlite import (
     NeighborTurn,
     OutcomeEvent,
     QUERY_PREFIX,
+    SCHEMA_VERSION,
     STORAGE_PREFIX,
     SqliteProvider,
+    VerifiedOutcome,
     build,
 )
 
@@ -458,3 +460,248 @@ def test_outcome_update_refreshes_knn_projection(provider):
     provider.attach_outcome("e1", make_outcome("closed_final", outcome_proxy_hard=True))
     second = provider.similar_turns(vec, k=1)
     assert second and second[0].outcome_proxy_hard is True   # projection refreshed
+
+
+def test_pre_v2_database_migrates_in_place(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE decisions (
+            route_id TEXT PRIMARY KEY, ts REAL, session_id TEXT, turn_index INT,
+            source TEXT, instr_sha256 TEXT, features_json TEXT, layer TEXT,
+            rung TEXT, cascade INT, score REAL, reason TEXT,
+            classifier_tier TEXT, propensity TEXT, policy_version TEXT,
+            classifier_ms REAL, decision_ms REAL
+        );
+        CREATE TABLE outcomes (
+            route_id TEXT PRIMARY KEY, status TEXT, escalated INT,
+            tripwire_name TEXT, tripwire_type TEXT, edit_failures INT,
+            error_results INT, output_tokens INT, latency_ms REAL,
+            cost_estimate REAL, interrupted INT, user_retried INT,
+            outcome_proxy_hard INT
+        );
+        CREATE TABLE embeddings (route_id TEXT PRIMARY KEY, dim INT, vec BLOB);
+        INSERT INTO decisions VALUES (
+            'legacy', 1.0, 's', 0, 'organic', 'sha', '{}', 'classifier',
+            'local', 1, 0.5, 'old', NULL, 'classifier', 'v1', 1.0, 2.0
+        );
+        INSERT INTO outcomes VALUES (
+            'legacy', 'closed_final', 1, 'edit_apply',
+            'TripwireType.DIALECT', 2, 2, 10, 20.0, 0.0, 0, 0, 1
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    migrated = SqliteProvider(db_path=db, embedder=FakeEmbedder())
+    assert migrated.health()
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    decision_columns = {r[1] for r in conn.execute("PRAGMA table_info(decisions)")}
+    outcome_columns = {r[1] for r in conn.execute("PRAGMA table_info(outcomes)")}
+    assert "trace_json" in decision_columns
+    assert {"continuation_count", "failure_cause", "task_signal_hard",
+            "verified_success", "verification_failure_cause"} <= outcome_columns
+    # The dialect escalation remains operational friction but is explicitly not
+    # a task-difficulty signal after migration.
+    assert conn.execute(
+        "SELECT outcome_proxy_hard, task_signal_hard FROM outcomes "
+        "WHERE route_id='legacy'").fetchone() == (1, 0)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outcome_events WHERE route_id='legacy'").fetchone()[0] == 1
+    conn.close()
+    migrated._conn.close()
+
+    # Reopening at the current version must not manufacture another event.
+    reopened = SqliteProvider(db_path=db, embedder=FakeEmbedder())
+    conn = sqlite3.connect(db)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outcome_events WHERE route_id='legacy'").fetchone()[0] == 1
+    conn.close()
+    reopened._conn.close()
+
+
+def test_newer_schema_fails_safe_instead_of_downgrading(tmp_path):
+    db = tmp_path / "future.db"
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    provider = SqliteProvider(db_path=db, embedder=FakeEmbedder())
+    assert provider.health() is False
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    conn.close()
+
+
+def test_verified_outcome_and_immutable_event_round_trip(provider):
+    provider.record_decision(make_decision("verified"))
+    event = OutcomeEvent(
+        status="closed_turn",
+        task_signal_hard=False,
+        continuation_count=2,
+        verification=VerifiedOutcome(
+            task_success=True,
+            quality_score=0.95,
+            verifier_source="pytest",
+            confidence=1.0,
+            verified_at=1234.0,
+            failure_cause=None,
+        ),
+    )
+    assert provider.attach_outcome("verified", event)
+    # Replaying the same immutable event is idempotent.
+    assert provider.attach_outcome("verified", event)
+    conn = sqlite3.connect(provider.db_path)
+    assert conn.execute(
+        "SELECT continuation_count, task_signal_hard, verified_success, "
+        "quality_score, verifier_source, verifier_confidence, verified_at "
+        "FROM outcomes WHERE route_id='verified'").fetchone() == (
+            2, 0, 1, 0.95, "pytest", 1.0, 1234.0)
+    # pending-at-decision + one accepted closed_turn event; replay adds nothing.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outcome_events WHERE route_id='verified'").fetchone()[0] == 2
+    conn.close()
+
+
+def test_late_verification_enriches_finalized_outcome_without_erasing_it(provider):
+    vector = [1.0, 0.0, 0.0, 0.0]
+    provider.record_decision(
+        make_decision("late", rung="local-code"), embedding=vector)
+    outcome = OutcomeEvent(
+        status="closed_final",
+        escalated=True,
+        tripwire_name="edit_apply",
+        tripwire_type="dialect",
+        edit_failures=3,
+        error_results=2,
+        output_tokens=450,
+        outcome_proxy_hard=True,
+        continuation_count=4,
+        failure_cause="harness_dialect",
+        task_signal_hard=True,
+    )
+    assert provider.attach_outcome("late", outcome)
+    verification = VerifiedOutcome(
+        task_success=True,
+        quality_score=0.98,
+        verifier_source="deterministic:v1",
+        confidence=1.0,
+        verified_at=2000.0,
+    )
+    assert provider.attach_verification(
+        "late", verification, event_id="verify-late", observed_at=2001.0)
+    # Replaying an immutable event is a no-op, even with different payload data.
+    assert provider.attach_verification(
+        "late", VerifiedOutcome(task_success=False),
+        event_id="verify-late", observed_at=3000.0)
+
+    conn = sqlite3.connect(provider.db_path)
+    assert conn.execute(
+        "SELECT status, escalated, edit_failures, error_results, "
+        "continuation_count, failure_cause, task_signal_hard, "
+        "verified_success, quality_score, verifier_source, verified_at "
+        "FROM outcomes WHERE route_id='late'"
+    ).fetchone() == (
+        "closed_final", 1, 3, 2, 4, "harness_dialect", 1,
+        1, 0.98, "deterministic:v1", 2000.0,
+    )
+    events = conn.execute(
+        "SELECT payload_json FROM outcome_events WHERE route_id='late' "
+        "ORDER BY observed_at"
+    ).fetchall()
+    assert len(events) == 3  # pending + closed_final + one verification
+    assert sum('"source": "verification"' in row[0] for row in events) == 1
+    conn.close()
+
+    neighbor = provider.similar_turns(vector, k=1)[0]
+    assert neighbor.verified_success is True
+    assert neighbor.verification_failure_cause is None
+
+
+def test_cross_connection_verification_invalidates_warm_projection(provider):
+    vector = [1.0, 0.0, 0.0, 0.0]
+    provider.record_decision(make_decision("cross-process"), embedding=vector)
+    assert provider.attach_outcome(
+        "cross-process", make_outcome(status="closed_final"))
+    assert provider.similar_turns(vector, k=1)[0].verified_success is None
+
+    verifier_process = SqliteProvider(provider.db_path, embedder=FakeEmbedder())
+    assert verifier_process.attach_verification(
+        "cross-process",
+        VerifiedOutcome(task_success=True, verifier_source="deterministic:v1"),
+        event_id="cross-process-verification",
+    )
+
+    # PRAGMA data_version changes on commits made by another connection, so the
+    # already-warm provider must rebuild without a local outcome write/restart.
+    assert provider.similar_turns(vector, k=1)[0].verified_success is True
+
+
+def test_lifecycle_update_preserves_verification_attached_while_pending(provider):
+    provider.record_decision(make_decision("early"))
+    verification = VerifiedOutcome(
+        task_success=False,
+        quality_score=0.2,
+        verifier_source="deterministic:v1",
+        confidence=1.0,
+        verified_at=50.0,
+        failure_cause="task_capability",
+    )
+    assert provider.attach_verification(
+        "early", verification, event_id="verify-early")
+    assert provider.attach_outcome("early", make_outcome("closed_turn"))
+
+    conn = sqlite3.connect(provider.db_path)
+    assert conn.execute(
+        "SELECT status, verified_success, quality_score, verifier_source, "
+        "verification_failure_cause FROM outcomes WHERE route_id='early'"
+    ).fetchone() == (
+        "closed_turn", 0, 0.2, "deterministic:v1", "task_capability")
+    conn.close()
+
+
+def test_attach_verification_unknown_route_returns_false(provider):
+    assert not provider.attach_verification(
+        "missing", VerifiedOutcome(task_success=True), event_id="missing-v")
+
+
+@pytest.mark.parametrize("verification", [
+    VerifiedOutcome(task_success=True, verifier_source=""),
+    VerifiedOutcome(
+        task_success=True, verifier_source="bad", quality_score=1.5),
+    VerifiedOutcome(
+        task_success=True, verifier_source="bad", confidence=float("nan")),
+    VerifiedOutcome(
+        task_success=True, verifier_source="bad", failure_cause="task_capability"),
+])
+def test_malformed_verification_is_rejected_without_an_audit_event(
+    provider, verification,
+):
+    provider.record_decision(make_decision("bad-verification"))
+    assert not provider.attach_verification(
+        "bad-verification", verification, event_id="invalid-verification")
+    conn = sqlite3.connect(provider.db_path)
+    assert conn.execute(
+        "SELECT verified_success, verifier_source FROM outcomes "
+        "WHERE route_id='bad-verification'").fetchone() == (None, None)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outcome_events "
+        "WHERE route_id='bad-verification'").fetchone()[0] == 1
+    conn.close()
+
+
+def test_verification_timestamp_defaults_to_observation_time(provider):
+    provider.record_decision(make_decision("verification-time"))
+    assert provider.attach_verification(
+        "verification-time",
+        VerifiedOutcome(task_success=None, verifier_source="deterministic:v1",
+                        failure_cause="unverifiable"),
+        event_id="verification-time-event",
+        observed_at=9876.5,
+    )
+    conn = sqlite3.connect(provider.db_path)
+    assert conn.execute(
+        "SELECT verified_at FROM outcomes WHERE route_id='verification-time'"
+    ).fetchone()[0] == 9876.5
+    conn.close()

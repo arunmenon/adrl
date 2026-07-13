@@ -25,6 +25,7 @@ CONTRACT_KEYS = {
     "path", "project", "bad_var", "good_var", "entity",   # preserved for Unit A
     "archetype", "language", "context_tokens_estimate",   # new
     "dominant_ext", "test_cmd", "planted_issue", "planted_secret",
+    "test_commands",
 }
 
 
@@ -82,6 +83,8 @@ def test_each_archetype_builds_real_git_repo(tmp_path, arch):
     assert isinstance(sb["good_var"], str) and sb["good_var"]
     assert isinstance(sb["entity"], str) and sb["entity"]
     assert isinstance(sb["context_tokens_estimate"], int)
+    assert sb["test_commands"]
+    assert all(isinstance(command["argv"], tuple) for command in sb["test_commands"])
 
     # a real git repo with a real initial commit
     assert (sb["path"] / ".git").is_dir()

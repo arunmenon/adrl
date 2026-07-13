@@ -159,6 +159,7 @@ class TripwireState:
         self._hit: Optional[TripwireHit] = None
         self._parse = 0
         self._edit = 0
+        self._error_results = 0
         self._call_history: list[str] = []        # canonical hashes, issue order
         self._max_loop = 0
         self._pending: dict[str, dict] = {}        # tool_use_id -> {name, input}
@@ -181,6 +182,21 @@ class TripwireState:
             "edit": self._edit,
             "loop": self._max_loop,
             "noprog": self._no_progress,
+        }
+
+    @property
+    def evidence(self) -> dict[str, int]:
+        """Canonical cumulative counters for the current turn.
+
+        These are outcome evidence, not all escalation strikes: every errored
+        tool result is counted even when it is an ordinary command failure,
+        while ``parse`` remains limited to schema/dialect failures.
+        """
+        return {
+            "edit_failures": self._edit,
+            "error_results": self._error_results,
+            "output_tokens": self._tokens,
+            "actions": self._actions,
         }
 
     # ── ingestion ───────────────────────────────────────────────────────────
@@ -274,6 +290,8 @@ class TripwireState:
 
             blob = _content_str(blk.get("content"))
             is_error = bool(blk.get("is_error"))
+            if is_error:
+                self._error_results += 1
             tid = blk.get("tool_use_id")
             use = self._pending.pop(tid, None) if isinstance(tid, str) else None
 

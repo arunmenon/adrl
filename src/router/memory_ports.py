@@ -3,7 +3,9 @@
 The router's transaction memory is an append-only ledger on a ``route_id``
 spine: a ``DecisionEvent`` is written once at decision time, an
 ``OutcomeEvent`` arrives late (lifecycle pending -> closed_turn ->
-closed_final), and instruction embeddings have their own cadence. Providers
+closed_final), and instruction embeddings have their own cadence. Every
+accepted outcome mutation also carries an immutable ``event_id`` for the
+provider audit log. Providers
 (SQLite Engram-lite, full Engram, Null) all implement the ``MemoryProvider``
 port below; the router only ever talks to the facade (memory_facade.py),
 which dispatches down a provider chain.
@@ -17,7 +19,9 @@ Import-only module — no CLI.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 # The mandatory nomic-embed-text task prefixes — part of the shared contract
@@ -52,6 +56,19 @@ class DecisionEvent:
     policy_version: str = ""
     classifier_ms: float = 0.0
     decision_ms: float = 0.0
+    trace_json: str = "{}"                 # scrubbed resolver provenance
+
+
+@dataclass(frozen=True)
+class VerifiedOutcome:
+    """Verifier-grade quality evidence; absent until a verifier has run."""
+
+    task_success: Optional[bool] = None
+    quality_score: Optional[float] = None
+    verifier_source: str = ""
+    confidence: Optional[float] = None
+    verified_at: Optional[float] = None
+    failure_cause: Optional[str] = None
 
 
 @dataclass
@@ -71,6 +88,12 @@ class OutcomeEvent:
     interrupted: bool = False
     user_retried: Optional[bool] = None      # known only at closed_final
     outcome_proxy_hard: Optional[bool] = None  # router.outcomes.outcome_proxy_hard
+    continuation_count: int = 0
+    failure_cause: Optional[str] = None
+    task_signal_hard: Optional[bool] = None
+    verification: Optional[VerifiedOutcome] = None
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    observed_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -93,6 +116,9 @@ class NeighborTurn:
     ts: float = 0.0
     session_id: str = ""
     user_retried: Optional[bool] = None
+    task_signal_hard: Optional[bool] = None
+    verified_success: Optional[bool] = None
+    verification_failure_cause: Optional[str] = None
 
 
 class MemoryProvider(ABC):
@@ -110,6 +136,17 @@ class MemoryProvider(ABC):
     @abstractmethod
     def attach_outcome(self, route_id: str, outcome: OutcomeEvent) -> bool:
         """Attach/update the outcome for a decision. False on any failure."""
+
+    @abstractmethod
+    def attach_verification(
+        self,
+        route_id: str,
+        verification: VerifiedOutcome,
+        *,
+        event_id: Optional[str] = None,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Append late verifier evidence without overwriting turn telemetry."""
 
     @abstractmethod
     def finalize_turn(self, session_id: str, *, prev_interrupted: bool,

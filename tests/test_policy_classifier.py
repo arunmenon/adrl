@@ -26,6 +26,16 @@ def test_classifier_hard_routes_frontier():
     assert r.rung == "frontier" and r.layer == "classifier" and not r.cascade
 
 
+def test_classifier_tier_wins_over_contradictory_boolean():
+    f = _middle_feature()
+    hard = route_turn(
+        f, SessionState("s"), classifier=lambda t: StubVerdict("hard", False))
+    trivial = route_turn(
+        f, SessionState("s"), classifier=lambda t: StubVerdict("trivial", True))
+    assert hard.rung == "frontier"
+    assert trivial.rung == "local"
+
+
 def test_classifier_local_routes_local_with_cascade():
     f = _middle_feature()
     r = route_turn(f, SessionState("s"), classifier=lambda t: StubVerdict("standard", False))

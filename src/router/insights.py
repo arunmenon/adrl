@@ -48,6 +48,12 @@ def _rows(conn, q, *a):
     return conn.execute(q, a).fetchall()
 
 
+def _has_column(conn, table: str, column: str) -> bool:
+    return column in {
+        str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+
+
 def _pct(n, d):
     return (100.0 * n / d) if d else 0.0
 
@@ -157,8 +163,27 @@ def _generate(conn) -> list[Insight]:
     ))
 
     # 5 — rule health seed (WS3): does middle_default->local hold up against outcomes?
+    task_signal = (
+        "o.task_signal_hard" if _has_column(
+            conn, "outcomes", "task_signal_hard") else "NULL"
+    )
+    verified_success = (
+        "o.verified_success" if _has_column(
+            conn, "outcomes", "verified_success") else "NULL"
+    )
+    verification_cause = (
+        "o.verification_failure_cause" if _has_column(
+            conn, "outcomes", "verification_failure_cause") else "NULL"
+    )
+    effective_hard = (
+        f"CASE WHEN {verified_success}=0 AND COALESCE({verification_cause}, "
+        "'task_capability')='task_capability' THEN 1 "
+        f"WHEN {verified_success}=1 AND d.rung IN "
+        "('local', 'local-code', 'local-small', 'cheap_cloud', 'cheap-cloud') "
+        f"THEN 0 ELSE COALESCE({task_signal}, o.outcome_proxy_hard) END"
+    )
     md_rows = _rows(conn,
-                    "SELECT d.rung, o.outcome_proxy_hard FROM decisions d "
+                    f"SELECT d.rung, {effective_hard} FROM decisions d "
                     "JOIN outcomes o ON o.route_id=d.route_id "
                     "WHERE d.layer='middle_default' AND o.status LIKE 'closed%'")
     if md_rows:
@@ -170,7 +195,7 @@ def _generate(conn) -> list[Insight]:
             title="The middle_default->local guess, audited",
             finding=f"{contradiction:.0f}% of middle turns kept local actually went hard.",
             detail=(f"Of {len(md_local)} turns the middle_default rule sent to local, {md_hard} "
-                    f"showed a hard outcome proxy (edit-fail / errors / interrupt / long loop). "
+                    f"showed a task-hard signal (falling back to the legacy proxy where needed). "
                     f"That is the exact slice the retrieval router should reclaim — where the "
                     f"coin-flip middle guessed cheap but the turn was not."),
             magnitude=min(1.0, contradiction / 100 + 0.3),

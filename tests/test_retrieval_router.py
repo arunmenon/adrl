@@ -19,10 +19,15 @@ from router.memory_ports import NeighborTurn
 from router.memory_sqlite import SqliteProvider
 
 
-def _n(sim, *, hard=False, source="organic", ts=0.0) -> NeighborTurn:
-    return NeighborTurn(route_id="x", similarity=sim, rung="local",
+def _n(sim, *, hard=False, source="organic", ts=0.0,
+       task_signal_hard=None, verified_success=None, rung="local",
+       verification_failure_cause=None) -> NeighborTurn:
+    return NeighborTurn(route_id="x", similarity=sim, rung=rung,
                         escalated=hard, outcome_proxy_hard=hard,
-                        source=source, ts=ts)
+                        source=source, ts=ts,
+                        task_signal_hard=task_signal_hard,
+                        verified_success=verified_success,
+                        verification_failure_cause=verification_failure_cause)
 
 
 # ── vote math ────────────────────────────────────────────────────────────────
@@ -37,6 +42,21 @@ def test_recency_weight_decay():
 def test_neighbor_went_hard():
     assert rr.neighbor_went_hard(_n(0.9, hard=True))
     assert not rr.neighbor_went_hard(_n(0.9, hard=False))
+    # A cause-clean v2 False overrides legacy escalation/friction contamination.
+    assert not rr.neighbor_went_hard(
+        _n(0.9, hard=True, task_signal_hard=False))
+    # Deterministic evidence outranks weak signals for non-frontier attempts.
+    assert not rr.neighbor_went_hard(
+        _n(0.9, hard=True, task_signal_hard=True, verified_success=True))
+    assert rr.neighbor_went_hard(
+        _n(0.9, hard=False, verified_success=False))
+    assert not rr.neighbor_went_hard(_n(
+        0.9, hard=False, verified_success=False,
+        verification_failure_cause="policy_constraint"))
+    # A frontier pass does not prove that frontier was necessary.
+    assert rr.neighbor_went_hard(_n(
+        0.9, hard=True, task_signal_hard=True,
+        verified_success=True, rung="frontier"))
 
 
 def test_decide_frontier_when_neighbors_mostly_hard():
@@ -166,12 +186,15 @@ def _seed(db_path: Path, rows: list[dict]) -> None:
             "instr_sha256, features_json, layer, rung) VALUES (?,?,?,?,?,?,?,?,?)",
             (rid, float(row.get("ts", i)), row.get("session", f"s{i}"), i,
              row.get("source", "organic"), "sha", "{}",
-             row.get("layer", "middle_default"), "local"),
+             row.get("layer", "middle_default"), row.get("rung", "local")),
         )
         conn.execute(
             "INSERT INTO outcomes (route_id, status, escalated, user_retried, "
-            "outcome_proxy_hard) VALUES (?, 'closed_final', ?, 0, ?)",
-            (rid, 1 if row.get("hard") else 0, 1 if row.get("hard") else 0),
+            "outcome_proxy_hard, verified_success, verification_failure_cause) "
+            "VALUES (?, 'closed_final', ?, 0, ?, ?, ?)",
+            (rid, 1 if row.get("hard") else 0, 1 if row.get("hard") else 0,
+             row.get("verified_success"),
+             row.get("verification_failure_cause")),
         )
         vec = np.asarray(row["vec"], dtype="<f4")
         conn.execute(
@@ -196,9 +219,28 @@ def _neighbor(vec=None, *, hard=True, source="organic", session):
 
 
 def _target(vec=None, *, layer="middle_default", hard=True, source="organic",
-            session="target"):
+            session="target", rung="local", verified_success=None,
+            verification_failure_cause=None):
     return {"vec": vec or _A, "layer": layer, "hard": hard, "source": source,
-            "session": session}
+            "session": session, "rung": rung,
+            "verified_success": verified_success,
+            "verification_failure_cause": verification_failure_cause}
+
+
+def test_shadow_target_uses_verifier_evidence_conservatively(tmp_path):
+    db = tmp_path / "verified-targets.db"
+    _seed(db, [
+        _target(hard=True, session="local", verified_success=True),
+        _target(hard=True, session="frontier", rung="frontier",
+                verified_success=True),
+        _target(hard=False, session="policy", verified_success=False,
+                verification_failure_cause="policy_constraint"),
+    ])
+    conn = sqlite3.connect(db)
+    targets = sr._load_targets(conn)
+    conn.close()
+
+    assert [target.actual_hard for target in targets] == [False, True, False]
 
 
 def _past(n: int, *, hard: bool = True, source: str = "organic", vec=None) -> list[dict]:

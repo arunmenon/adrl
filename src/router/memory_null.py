@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .memory_ports import DecisionEvent, MemoryProvider, NeighborTurn, OutcomeEvent
+from .memory_ports import (
+    DecisionEvent,
+    MemoryProvider,
+    NeighborTurn,
+    OutcomeEvent,
+    VerifiedOutcome,
+)
 
 
 class NullProvider(MemoryProvider):
@@ -27,6 +33,12 @@ class NullProvider(MemoryProvider):
         return route_id if isinstance(route_id, str) and route_id else None
 
     def attach_outcome(self, route_id: str, outcome: OutcomeEvent) -> bool:
+        return True
+
+    def attach_verification(
+        self, route_id: str, verification: VerifiedOutcome, *,
+        event_id: Optional[str] = None, observed_at: Optional[float] = None,
+    ) -> bool:
         return True
 
     def finalize_turn(self, session_id: str, *, prev_interrupted: bool = False,

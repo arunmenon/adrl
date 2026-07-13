@@ -42,7 +42,7 @@ from router.graph_lite import project_from_ledger
 from router.memory_facade import RouterMemory
 from router.memory_ports import OutcomeEvent
 from router.memory_sqlite import STORAGE_PREFIX, SqliteProvider
-from router.outcomes import outcome_proxy_hard
+from router.outcomes import FailureCause, outcome_proxy_hard, task_signal_hard
 from router.policy import SessionState, route_turn
 
 DEFAULT_PARQUET_PATH = Path("data/turns.parquet")
@@ -172,6 +172,18 @@ def _outcome_for(row: dict) -> OutcomeEvent:
         "interrupted": bool(row.get("interrupted")),
         "n_continuations": row.get("n_continuations") or 0,
     }
+    continuation_count = int(proxy_row["n_continuations"])
+    if proxy_row["interrupted"]:
+        failure_cause = FailureCause.USER_ABORT.value
+    elif continuation_count >= 10:
+        failure_cause = FailureCause.TASK_CAPABILITY.value
+    elif proxy_row["n_edit_failures"] or proxy_row["n_error_results"]:
+        # Historical rows cannot distinguish ordinary command errors from
+        # harness dialect failures. Preserve friction but do not invent a task
+        # capability label.
+        failure_cause = FailureCause.UNVERIFIABLE.value
+    else:
+        failure_cause = None
     return OutcomeEvent(
         status="closed_final",
         escalated=False,
@@ -185,6 +197,12 @@ def _outcome_for(row: dict) -> OutcomeEvent:
         interrupted=bool(proxy_row["interrupted"]),
         user_retried=None,
         outcome_proxy_hard=outcome_proxy_hard(proxy_row),
+        continuation_count=continuation_count,
+        failure_cause=failure_cause,
+        task_signal_hard=task_signal_hard(
+            tripwire_type="quality" if proxy_row["interrupted"] else None,
+            continuation_count=continuation_count,
+        ),
     )
 
 

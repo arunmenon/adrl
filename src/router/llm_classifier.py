@@ -156,8 +156,10 @@ def parse_verdict(content: Optional[str]) -> Optional[LlmVerdict]:
 
     if tier is None:
         return None
-    if frontier is None:
-        frontier = tier == "hard"
+    # The tier is the canonical verdict. Model output occasionally contradicts
+    # its own schema (e.g. hard + false); deriving the boolean prevents that
+    # malformed pair from silently routing a hard task locally.
+    frontier = tier == "hard"
 
     return LlmVerdict(
         tier=tier,
