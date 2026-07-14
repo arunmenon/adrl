@@ -1,0 +1,236 @@
+{
+  "architecture_evidence_index": {
+    "bucket_weighting": "normalized versioned bucket weights",
+    "buckets": {
+      "CAS": {
+        "decision_count": 7,
+        "decision_weight": 0.14285714285714285,
+        "evidence_profile": {
+          "D2 Tested": 5,
+          "D3 Shadow": 2
+        },
+        "score": 45.7,
+        "score_unrounded": 45.714285714285715,
+        "weight": 0.1111111111111111
+      },
+      "EVL": {
+        "decision_count": 9,
+        "decision_weight": 0.1111111111111111,
+        "evidence_profile": {
+          "D0 Design": 3,
+          "D2 Tested": 2,
+          "D3 Shadow": 4
+        },
+        "score": 35.6,
+        "score_unrounded": 35.55555555555556,
+        "weight": 0.1111111111111111
+      },
+      "FND": {
+        "decision_count": 5,
+        "decision_weight": 0.2,
+        "evidence_profile": {
+          "D2 Tested": 1,
+          "D3 Shadow": 3,
+          "D4 Pilot": 1
+        },
+        "score": 60.0,
+        "score_unrounded": 60.0,
+        "weight": 0.1111111111111111
+      },
+      "LRN": {
+        "decision_count": 7,
+        "decision_weight": 0.14285714285714285,
+        "evidence_profile": {
+          "D0 Design": 3,
+          "D2 Tested": 4
+        },
+        "score": 22.9,
+        "score_unrounded": 22.857142857142858,
+        "weight": 0.1111111111111111
+      },
+      "MEM": {
+        "decision_count": 9,
+        "decision_weight": 0.1111111111111111,
+        "evidence_profile": {
+          "D2 Tested": 8,
+          "D3 Shadow": 1
+        },
+        "score": 42.2,
+        "score_unrounded": 42.22222222222222,
+        "weight": 0.1111111111111111
+      },
+      "OPS": {
+        "decision_count": 8,
+        "decision_weight": 0.125,
+        "evidence_profile": {
+          "D1 Code": 1,
+          "D2 Tested": 5,
+          "D4 Pilot": 2
+        },
+        "score": 47.5,
+        "score_unrounded": 47.5,
+        "weight": 0.1111111111111111
+      },
+      "RTG": {
+        "decision_count": 8,
+        "decision_weight": 0.125,
+        "evidence_profile": {
+          "D0 Design": 1,
+          "D2 Tested": 3,
+          "D3 Shadow": 4
+        },
+        "score": 45.0,
+        "score_unrounded": 45.0,
+        "weight": 0.1111111111111111
+      },
+      "SAF": {
+        "decision_count": 7,
+        "decision_weight": 0.14285714285714285,
+        "evidence_profile": {
+          "D2 Tested": 6,
+          "D3 Shadow": 1
+        },
+        "score": 42.9,
+        "score_unrounded": 42.857142857142854,
+        "weight": 0.1111111111111111
+      },
+      "SEM": {
+        "decision_count": 6,
+        "decision_weight": 0.16666666666666666,
+        "evidence_profile": {
+          "D0 Design": 1,
+          "D2 Tested": 2,
+          "D3 Shadow": 3
+        },
+        "score": 43.3,
+        "score_unrounded": 43.333333333333336,
+        "weight": 0.1111111111111111
+      }
+    },
+    "confidence": {
+      "limitation": "D-levels identify evidence stage; statistical confidence is reported separately for label precision",
+      "representation": "per-bucket D-level evidence profile"
+    },
+    "decision_weighting": "equal_within_bucket",
+    "name": "architecture_evidence_index_not_production_readiness",
+    "rounding_digits": 1,
+    "scale": {
+      "D0 Design": 0,
+      "D1 Code": 20,
+      "D2 Tested": 40,
+      "D3 Shadow": 60,
+      "D4 Pilot": 80,
+      "D5 Graduated": 100
+    },
+    "score": 42.8,
+    "score_contract": {
+      "sha256": "d26f5175f43a66aac99d80887c88de81ac6683d39127c53553a3d859df677bb4",
+      "taxonomy_version": "1.0",
+      "version": "architecture-evidence-index-v1"
+    },
+    "score_unrounded": 42.782186948853614,
+    "source": {
+      "decision_count": 66,
+      "path": "docs/adr-index.md",
+      "taxonomy_evidence_sha256": "38e05c6e5e6f788da98888afed6a832149eb1d4be1e5c1d426ade6417d1544a5"
+    }
+  },
+  "baseline": {
+    "comparison": "comparable_same_contract",
+    "current_delta": 2.3,
+    "id": "taxonomy-v1-freeze-a46ca8c",
+    "recorded_at": "2026-07-13T11:22:57+05:30",
+    "score": 40.5,
+    "source_git_commit": "a46ca8ca5d0c293fb701fedfe2575a78d8d491d8"
+  },
+  "blockers": [
+    "organic_verifier_labels",
+    "label_precision",
+    "learned_router_authority"
+  ],
+  "counts": {
+    "cause_clean_organic_labels": 1,
+    "counterfactual_records": 2,
+    "decisions": 793,
+    "deterministic_verified_rows": 1,
+    "eligible_classifier_provenance_complete": 4,
+    "eligible_middle_decisions": 84,
+    "invalid_counterfactual_records": 0,
+    "invalid_verification_contexts": 0,
+    "outcome_closed_final": 790,
+    "outcome_closed_turn": 3,
+    "representative_same_snapshot_pairs": 1,
+    "source_organic": 763,
+    "source_simulator": 30,
+    "usable_classifier_provenance_complete": 0,
+    "usable_final_middle_labels": 0,
+    "valid_counterfactual_records": 2,
+    "valid_same_snapshot_pairs": 1,
+    "valid_verification_contexts": 1,
+    "verification_contexts": 1,
+    "verified_rows": 1
+  },
+  "gates": {
+    "classifier_provenance": {
+      "evidence": "0/0 usable labels have complete provenance",
+      "status": "not_evaluated"
+    },
+    "feature_contract": {
+      "evidence": "0 ledger rows violate the versioned schema",
+      "status": "pass"
+    },
+    "label_precision": {
+      "evidence": "1 valid independent reviews under label-precision-v1",
+      "status": "blocked"
+    },
+    "learned_router_authority": {
+      "evidence": "no calibrated artifact has beaten required baselines on clean holdouts",
+      "status": "blocked"
+    },
+    "organic_verifier_labels": {
+      "evidence": "0 cause-clean, finalized, eligible organic labels",
+      "status": "blocked"
+    },
+    "paired_counterfactual_integrity": {
+      "evidence": "1 valid local/frontier same-snapshot pairs",
+      "status": "pass"
+    },
+    "representative_pairs": {
+      "evidence": "1 pairs originate from organic tasks",
+      "status": "pass"
+    }
+  },
+  "generated_at": "2026-07-13T18:07:08.517975+00:00",
+  "label_audit": {
+    "confidence_level": 0.95,
+    "invalid_reviews": 0,
+    "minimum_wilson_lower_bound": 0.9,
+    "passes": false,
+    "policy_version": "label-precision-v1",
+    "strata": {
+      "success": {
+        "agreement_rate": 1.0,
+        "agreements": 1,
+        "passes": false,
+        "reviewed": 1,
+        "wilson_lower_bound": 0.20654931437723742
+      },
+      "task_capability_failure": {
+        "agreement_rate": 0.0,
+        "agreements": 0,
+        "passes": false,
+        "reviewed": 0,
+        "wilson_lower_bound": 0.0
+      }
+    },
+    "valid_reviews": 1
+  },
+  "production_readiness": "blocked",
+  "schema_version": "learning-readiness-v1",
+  "score_contract": {
+    "sha256": "d26f5175f43a66aac99d80887c88de81ac6683d39127c53553a3d859df677bb4",
+    "taxonomy_version": "1.0",
+    "version": "architecture-evidence-index-v1"
+  },
+  "snapshot_id": "readiness:5fb2f4f45864a9ce69be337378e5811838509e0841f18bb532471f5da11fb5c2"
+}

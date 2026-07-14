@@ -106,7 +106,10 @@ Cleanup / design angles (lower priority than correctness):
     behavior? Does the diff violate an accepted decision, bypass a `SAF` gate, or
     claim a maturity increase without the durable evidence required by
     `docs/adr-index.md`? Is new behavior disguised as `adds evidence`, `none`, or
-    a refactor? Missing or materially wrong classification is a finding.
+    a refactor? If a readiness number changed, does it use the exact persisted
+    contract version/hash and immutable baseline from `docs/readiness-scoring.md`,
+    with matching JSON, Markdown, and history artifacts? Missing or materially
+    wrong classification is a finding.
 
 ## Phase 3 - Verify each candidate adversarially
 

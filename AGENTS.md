@@ -42,6 +42,10 @@ throughout source code unless they explain a genuinely non-obvious constraint.
   alone cannot change the architecture.
 - Safety (`SAF`) decisions and evaluation graduation gates (`EVL`) cannot be
   overridden by routing, learning, or implementation convenience.
+- Readiness claims must come from `reports/learning-readiness.json` under the
+  exact version and hash in `config/readiness-score-v1.json`. Do not blend older
+  estimates into that comparable series. A formula change requires a new
+  versioned contract and baseline; never rewrite the v1 baseline or history.
 
 ## Implementation workflow
 
@@ -56,6 +60,13 @@ throughout source code unless they explain a genuinely non-obvious constraint.
 
   ```bash
   python3 tools/check_adr_taxonomy.py
+  ```
+
+- If ADR maturity or readiness evidence changes, persist and validate the score:
+
+  ```bash
+  PYTHONPATH=src .venv/bin/python -m router.learning_readiness --persist
+  .venv/bin/python tools/check_readiness_score.py
   ```
 
 - For the full Python suite, use:

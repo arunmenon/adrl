@@ -34,6 +34,7 @@ def test_valid_pr_classification_passes():
 - Decision effect: `adds evidence`
 - Maturity transition: `none`
 - Evidence produced: validator tests and CI execution
+- Readiness contract/delta: `none`
 - Architectural non-goals: no runtime routing behavior changes
 """
 
@@ -49,11 +50,12 @@ def test_pr_placeholders_and_unknown_ids_fail():
 - Decision effect: `implements | changes`
 - Maturity transition: `D_ -> D_ | none`
 - Evidence produced:
+- Readiness contract/delta: `none | VERSION HASH: OLD -> NEW`
 - Architectural non-goals:
 """
 
     pr_errors = validate_pr_body(body, {row["id"] for row in decisions})
 
-    assert len(pr_errors) == 6
+    assert len(pr_errors) == 7
     assert any("primary ADRL ID" in error for error in pr_errors)
     assert any("secondary ADRL ID" in error for error in pr_errors)

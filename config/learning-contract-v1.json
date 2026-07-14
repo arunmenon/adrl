@@ -1,0 +1,147 @@
+{
+  "contract_version": "adrl-learning-v1",
+  "feature_schema": {
+    "version": "predecision-turn-v1",
+    "fields": [
+      {
+        "name": "verb_class",
+        "type": "string",
+        "values": ["trivial", "explain", "small_edit", "write", "fix", "hard", "unknown"]
+      },
+      {
+        "name": "verb_score",
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0
+      },
+      {
+        "name": "broad_scope",
+        "type": "boolean"
+      },
+      {
+        "name": "narrow_scope",
+        "type": "boolean"
+      },
+      {
+        "name": "context_tokens",
+        "type": "integer",
+        "minimum": 0
+      },
+      {
+        "name": "turn_index",
+        "type": "integer",
+        "minimum": 0
+      },
+      {
+        "name": "recent_errors",
+        "type": "integer",
+        "minimum": 0
+      },
+      {
+        "name": "recent_edit_failures",
+        "type": "integer",
+        "minimum": 0
+      },
+      {
+        "name": "prev_turn_interrupted",
+        "type": "boolean"
+      }
+    ],
+    "drop_before_training": [
+      "privacy_pinned",
+      "escalated_this_episode",
+      "is_terse_continuation",
+      "extra"
+    ],
+    "forbidden": [
+      "instruction_text",
+      "instr_sha256",
+      "route_id",
+      "session_id",
+      "source",
+      "layer",
+      "rung",
+      "cascade",
+      "score",
+      "reason",
+      "classifier_tier",
+      "propensity",
+      "policy_version",
+      "classifier_ms",
+      "decision_ms",
+      "trace_json",
+      "status",
+      "escalated",
+      "tripwire_name",
+      "tripwire_type",
+      "output_tokens",
+      "latency_ms",
+      "cost_estimate",
+      "interrupted",
+      "user_retried",
+      "outcome_proxy_hard",
+      "task_signal_hard",
+      "verified_success",
+      "quality_score",
+      "verifier_source",
+      "verifier_confidence",
+      "verified_at",
+      "failure_cause"
+    ]
+  },
+  "eligibility": {
+    "decision_sources": ["organic", "counterfactual"],
+    "decision_layers": ["classifier", "middle_default"],
+    "exclude_if_true": [
+      "privacy_pinned",
+      "escalated_this_episode",
+      "is_terse_continuation"
+    ]
+  },
+  "label_schema": {
+    "version": "verified-outcome-v1",
+    "verifier_source_prefixes": ["deterministic:"],
+    "minimum_confidence": 1.0,
+    "cause_clean_failure_causes": ["task_capability"],
+    "target_components": [
+      "verified_success",
+      "quality_score",
+      "cost_estimate",
+      "latency_ms",
+      "user_retried"
+    ]
+  },
+  "pair_schema": {
+    "version": "same-snapshot-local-frontier-v1",
+    "local_rungs": ["local", "local-code", "local-small"],
+    "frontier_rungs": ["frontier"],
+    "same_fields": [
+      "task_id",
+      "repository_sha256",
+      "snapshot_commit",
+      "verification_plan_sha256",
+      "features_sha256"
+    ]
+  },
+  "split_policy": {
+    "version": "repository-task-temporal-v1",
+    "splits": ["train", "temporal_holdout", "repository_task_holdout"],
+    "group_key": "pair_id",
+    "repository_task_holdout_is_unseen": true,
+    "pair_may_cross_splits": false
+  },
+  "artifact_manifest": {
+    "version": "learned-router-artifact-v1",
+    "required_fields": [
+      "artifact_version",
+      "contract_version",
+      "feature_schema_version",
+      "feature_schema_sha256",
+      "data_snapshot_sha256",
+      "objective",
+      "calibration",
+      "thresholds",
+      "policy_compatibility"
+    ]
+  }
+}

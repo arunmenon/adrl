@@ -45,6 +45,8 @@ Draft v2 incorporates an internal consistency review and deep-research vetting a
 - [Tool-ID assumption (B5)](reports/assumption-tool-ids.md) — answered: IDs need internal consistency, not re-minting
 - [Local-rung scenarios (S5/S7)](reports/scenario-local-rung.md) — S5 falsified for this model (~1.0 reliability), S7 fallback confirmed
 - **[Phase 0 exit report](reports/phase0-exit.md)** — every §10 criterion pass/fail, the business case, and the Phase-1 handoff
+- **[Learning-readiness scorecard](reports/learning-readiness.md)** - transparent ADR evidence index, organic-label counts, statistical label audit, and hard graduation blockers
+- [Readiness scoring contract](docs/readiness-scoring.md) - frozen formula, `40.5` v1 baseline, append-only milestone history, and change-control rules
 
 ## Setup
 
@@ -57,6 +59,70 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 All data (transcripts, wire captures, derived datasets) lives under `data/`, which is
 **gitignored — it contains real secrets and never leaves the machine** (plan decision D5).
+
+## Deterministic verification for organic routes
+
+Organic verifier labels use an explicit two-step job. Obtain the exact `route_id` from
+the routing capture or harness callback; never infer it from the nearest session or
+timestamp. Before the first repository edit, provide an opaque task ID, the model that
+actually served the turn, and a repository-specific JSON plan:
+
+```json
+{
+  "plan_version": "targeted-tests-v1",
+  "command_checks": [
+    {
+      "name": "targeted-tests",
+      "argv": [".venv/bin/python", "-m", "pytest", "tests/test_target.py", "-q"],
+      "timeout_s": 300
+    }
+  ],
+  "require_changes": true,
+  "forbidden_path_globs": [".git/**", "data/**"],
+  "max_changed_files": 20
+}
+```
+
+The plan is argv-only and must contain a required functional/content check; a file diff
+alone cannot become a success label. Start from a clean Git workspace, then finish after
+the task's edits and tool calls complete:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m router.live_verification begin \
+  --route-id ROUTE_ID --task-id opaque-task-001 --workspace /path/to/repo \
+  --plan /path/to/verification-plan.json --served-rung local-code \
+  --model local/model-id --harness codex
+
+PYTHONPATH=src .venv/bin/python -m router.live_verification finish \
+  --job-id JOB_ID
+```
+
+`finish` enriches the immutable route ledger and appends scrubbed provenance to
+`data/verified-evidence.jsonl`. Raw prompts and repository paths are not copied into
+that evidence stream. The local job file retains the workspace and plan at mode `0600`
+so the exact baseline can be verified and retried idempotently.
+
+## Same-snapshot counterfactual pairs
+
+`router.counterfactual.run_counterfactual` clones one clean Git commit into an isolated
+workspace per candidate and runs the same deterministic plan for every rung. Its JSONL
+records now implement `counterfactual-evidence-v1`: pair ID, scrubbed predecision
+features, repository/snapshot/plan hashes, exact model and harness, cost/latency, and
+verifier result. Set `CounterfactualTask.source="organic"` only when the task came from
+organic traffic; simulator-generated tasks remain `synthetic` and cannot satisfy the
+representative-pair gate.
+
+Persist the canonical evidence snapshot and graduation gates after a milestone:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m router.learning_readiness --persist
+.venv/bin/python tools/check_readiness_score.py
+```
+
+The generator writes matching Markdown and JSON reports and appends one history
+entry per distinct evidence state. The architecture index is comparable only to
+the frozen `40.5` baseline under the exact v1 contract hash; production readiness
+remains a separate hard-gate verdict.
 
 ## The transcript miner (workstream A)
 

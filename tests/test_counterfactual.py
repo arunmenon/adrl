@@ -22,6 +22,9 @@ from router.counterfactual import (
     verification_plan_from_sandbox,
 )
 from router.outcomes import FailureCause
+from router.learning_contract import (
+    learning_evidence_from_counterfactual_record,
+)
 from router.memory_sqlite import DecisionEvent, SqliteProvider
 from router.verifier import CommandCheck, VerificationPlan
 from router.verifier import (
@@ -122,6 +125,16 @@ def test_candidates_run_from_same_snapshot_in_isolated_clones(tmp_path):
     assert {row["prompt_sha256"] for row in rows} == {expected_hash}
     assert all(row["prompt"] is None for row in rows)
     assert {row["snapshot_commit"] for row in rows} == {commit}
+    assert {row["evidence_schema_version"] for row in rows} == {
+        "counterfactual-evidence-v1"}
+    assert len({row["pair_id"] for row in rows}) == 1
+    assert all(len(row["repository_sha256"]) == 64 for row in rows)
+    assert all(len(row["verification_plan_sha256"]) == 64 for row in rows)
+    assert all("instruction_text" not in row["features"] for row in rows)
+    evidence = [learning_evidence_from_counterfactual_record(row) for row in rows]
+    assert [item.verified_success for item in evidence] == [True, False, True]
+    assert {item.features_sha256 for item in evidence} == {
+        rows[0]["features_sha256"]}
     assert stat.S_IMODE(Path(run.dataset_path).stat().st_mode) == 0o600
 
 

@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -23,6 +25,8 @@ jobs:
         run: PYTHONPATH=src python -m compileall -q src tests
       - name: Validate ADR taxonomy
         run: python tools/check_adr_taxonomy.py
+      - name: Validate readiness score artifacts
+        run: python tools/check_readiness_score.py
       - name: Validate PR architecture classification
         if: github.event_name == 'pull_request'
         env:

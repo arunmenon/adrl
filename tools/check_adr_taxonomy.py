@@ -174,6 +174,17 @@ def validate_pr_body(body: str, valid_ids: set[str]) -> list[str]:
 
     if not fields.get("evidence produced", ""):
         errors.append("PR evidence produced field must be completed")
+    readiness = fields.get("readiness contract/delta", "")
+    if readiness.lower() != "none" and not re.fullmatch(
+        r"[A-Za-z0-9._-]+\s+[0-9a-f]{64}:\s*"
+        r"\d+(?:\.\d+)?\s*->\s*\d+(?:\.\d+)?"
+        r"(?:\s*\([+-]\d+(?:\.\d+)?\))?",
+        readiness,
+    ):
+        errors.append(
+            "PR readiness contract/delta must be 'none' or "
+            "'VERSION SHA256: OLD -> NEW'"
+        )
     if not fields.get("architectural non-goals", ""):
         errors.append("PR architectural non-goals field must be completed")
 

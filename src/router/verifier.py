@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
+import math
 import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .memory_ports import VerifiedOutcome
 from .outcomes import FailureCause
@@ -82,6 +84,213 @@ class VerificationPlan:
         "site/**", "**/site/**", "coverage/**", "**/coverage/**",
     )
     max_changed_files: Optional[int] = None
+
+
+class VerificationPlanError(ValueError):
+    """A serialized plan is malformed, unsafe, or vacuous."""
+
+
+_PLAN_KEYS = {
+    "command_checks", "content_checks", "repository_checks",
+    "require_changes", "protect_tests", "forbidden_path_globs",
+    "allowed_path_globs", "required_new_path_globs",
+    "ignored_untracked_path_globs", "max_changed_files",
+}
+_COMMAND_KEYS = {
+    "name", "argv", "cwd", "timeout_s", "required", "pass_codes", "env",
+}
+_CONTENT_KEYS = {
+    "name", "path", "must_contain", "must_not_contain", "required",
+}
+_REPOSITORY_KEYS = {
+    "name", "path_globs", "must_match", "must_not_match", "required",
+    "max_file_bytes",
+}
+
+
+def _plan_object(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise VerificationPlanError(f"{name} must be an object")
+    return value
+
+
+def _plan_keys(value: Mapping[str, Any], allowed: set[str], name: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise VerificationPlanError(
+            f"{name} has unknown fields: {', '.join(sorted(unknown))}")
+
+
+def _plan_text(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise VerificationPlanError(f"{name} must be a non-empty string")
+    return value
+
+
+def _plan_strings(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise VerificationPlanError(f"{name} must be a list of non-empty strings")
+    return tuple(value)
+
+
+def _relative_plan_path(value: Any, name: str, *, directory: bool = False) -> str:
+    text = _plan_text(value, name)
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        raise VerificationPlanError(f"{name} must stay inside the workspace")
+    if directory and text == "":
+        raise VerificationPlanError(f"{name} cannot be empty")
+    return text
+
+
+def _plan_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise VerificationPlanError(f"{name} must be boolean")
+    return value
+
+
+def verification_plan_from_mapping(value: Mapping[str, Any]) -> VerificationPlan:
+    """Parse a strict argv-only plan suitable for trusted local execution.
+
+    A serialized live plan must include at least one required functional or
+    content check. Merely changing a file is not verifier-grade task evidence.
+    """
+    value = _plan_object(value, "verification plan")
+    _plan_keys(value, _PLAN_KEYS, "verification plan")
+
+    command_checks: list[CommandCheck] = []
+    for index, raw in enumerate(value.get("command_checks", ())):
+        item = _plan_object(raw, f"command_checks[{index}]")
+        _plan_keys(item, _COMMAND_KEYS, f"command_checks[{index}]")
+        argv = _plan_strings(item.get("argv"), f"command_checks[{index}].argv")
+        timeout = item.get("timeout_s", 120.0)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise VerificationPlanError("command timeout must be numeric")
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or not 0.0 < timeout <= 3600.0:
+            raise VerificationPlanError("command timeout must be in (0, 3600]")
+        pass_codes = item.get("pass_codes", (0,))
+        if not isinstance(pass_codes, (list, tuple)) or not pass_codes or any(
+            isinstance(code, bool) or not isinstance(code, int) for code in pass_codes
+        ):
+            raise VerificationPlanError("command pass_codes must be integers")
+        env = item.get("env", {})
+        if not isinstance(env, Mapping) or any(
+            not isinstance(key, str) or not key
+            or not isinstance(env_value, str)
+            for key, env_value in env.items()
+        ):
+            raise VerificationPlanError("command env must map strings to strings")
+        required = item.get("required", True)
+        command_checks.append(CommandCheck(
+            name=_plan_text(item.get("name"), f"command_checks[{index}].name"),
+            argv=argv,
+            cwd=_relative_plan_path(
+                item.get("cwd", "."), f"command_checks[{index}].cwd",
+                directory=True),
+            timeout_s=timeout,
+            required=_plan_bool(required, "command required"),
+            pass_codes=tuple(pass_codes),
+            env=dict(env),
+        ))
+
+    content_checks: list[ContentCheck] = []
+    for index, raw in enumerate(value.get("content_checks", ())):
+        item = _plan_object(raw, f"content_checks[{index}]")
+        _plan_keys(item, _CONTENT_KEYS, f"content_checks[{index}]")
+        required = item.get("required", True)
+        content_checks.append(ContentCheck(
+            name=_plan_text(item.get("name"), f"content_checks[{index}].name"),
+            path=_relative_plan_path(
+                item.get("path"), f"content_checks[{index}].path"),
+            must_contain=_plan_strings(
+                item.get("must_contain", ()),
+                f"content_checks[{index}].must_contain"),
+            must_not_contain=_plan_strings(
+                item.get("must_not_contain", ()),
+                f"content_checks[{index}].must_not_contain"),
+            required=_plan_bool(required, "content required"),
+        ))
+
+    repository_checks: list[RepositoryContentCheck] = []
+    for index, raw in enumerate(value.get("repository_checks", ())):
+        item = _plan_object(raw, f"repository_checks[{index}]")
+        _plan_keys(item, _REPOSITORY_KEYS, f"repository_checks[{index}]")
+        max_bytes = item.get("max_file_bytes", 1_000_000)
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise VerificationPlanError("repository max_file_bytes must be positive")
+        required = item.get("required", True)
+        repository_checks.append(RepositoryContentCheck(
+            name=_plan_text(item.get("name"), f"repository_checks[{index}].name"),
+            path_globs=_plan_strings(
+                item.get("path_globs"), f"repository_checks[{index}].path_globs"),
+            must_match=_plan_strings(
+                item.get("must_match", ()),
+                f"repository_checks[{index}].must_match"),
+            must_not_match=_plan_strings(
+                item.get("must_not_match", ()),
+                f"repository_checks[{index}].must_not_match"),
+            required=_plan_bool(required, "repository check required"),
+            max_file_bytes=max_bytes,
+        ))
+
+    check_names = [
+        check.name for check in (*command_checks, *content_checks, *repository_checks)
+    ]
+    if len(check_names) != len(set(check_names)):
+        raise VerificationPlanError("verification check names must be unique")
+    if not any(
+        check.required
+        for check in (*command_checks, *content_checks, *repository_checks)
+    ):
+        raise VerificationPlanError(
+            "verification plan requires at least one required functional check")
+
+    def string_option(name: str, default: Sequence[str]) -> tuple[str, ...]:
+        return _plan_strings(value.get(name, default), name)
+
+    require_changes = value.get("require_changes", True)
+    protect_tests = value.get("protect_tests", False)
+    max_changed_files = value.get("max_changed_files")
+    if max_changed_files is not None and (
+        isinstance(max_changed_files, bool)
+        or not isinstance(max_changed_files, int)
+        or max_changed_files < 0
+    ):
+        raise VerificationPlanError("max_changed_files must be non-negative")
+    forbidden_path_globs = string_option("forbidden_path_globs", (".git/**",))
+    if ".git/**" not in forbidden_path_globs:
+        raise VerificationPlanError(
+            "serialized plans cannot remove the .git/** protected path")
+    return VerificationPlan(
+        command_checks=tuple(command_checks),
+        content_checks=tuple(content_checks),
+        repository_checks=tuple(repository_checks),
+        require_changes=_plan_bool(require_changes, "require_changes"),
+        protect_tests=_plan_bool(protect_tests, "protect_tests"),
+        forbidden_path_globs=forbidden_path_globs,
+        allowed_path_globs=string_option("allowed_path_globs", ()),
+        required_new_path_globs=string_option("required_new_path_globs", ()),
+        ignored_untracked_path_globs=string_option(
+            "ignored_untracked_path_globs", VerificationPlan().ignored_untracked_path_globs),
+        max_changed_files=max_changed_files,
+    )
+
+
+def verification_plan_to_mapping(plan: VerificationPlan) -> dict[str, Any]:
+    if not isinstance(plan, VerificationPlan):
+        raise VerificationPlanError("plan must be a VerificationPlan")
+    return asdict(plan)
+
+
+def verification_plan_sha256(plan: VerificationPlan) -> str:
+    payload = json.dumps(
+        verification_plan_to_mapping(plan), allow_nan=False,
+        separators=(",", ":"), sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -316,6 +525,17 @@ def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess:
         )
     except (OSError, subprocess.TimeoutExpired):
         return subprocess.CompletedProcess(command, 127, "", "")
+
+
+def repository_identity_sha256(workspace: Path, baseline_commit: str) -> str:
+    """Stable repository group without persisting paths or remote credentials."""
+    remote = _git(workspace, "config", "--get", "remote.origin.url")
+    if remote.returncode == 0 and remote.stdout.strip():
+        identity = "origin:" + remote.stdout.strip()
+    else:
+        roots = _git(workspace, "rev-list", "--max-parents=0", baseline_commit)
+        identity = "roots:" + (roots.stdout.strip() or baseline_commit)
+    return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
 
 
 def collect_changes(

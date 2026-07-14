@@ -1,0 +1,50 @@
+{
+  "schema_version": "readiness-score-contract-v1",
+  "contract_version": "architecture-evidence-index-v1",
+  "taxonomy_version": "1.0",
+  "index": {
+    "name": "architecture_evidence_index_not_production_readiness",
+    "accepted_state": "Accepted",
+    "maturity_points": {
+      "D0 Design": 0,
+      "D1 Code": 20,
+      "D2 Tested": 40,
+      "D3 Shadow": 60,
+      "D4 Pilot": 80,
+      "D5 Graduated": 100
+    },
+    "bucket_order": [
+      "FND",
+      "SEM",
+      "SAF",
+      "RTG",
+      "CAS",
+      "MEM",
+      "LRN",
+      "EVL",
+      "OPS"
+    ],
+    "bucket_weights": {
+      "FND": 1,
+      "SEM": 1,
+      "SAF": 1,
+      "RTG": 1,
+      "CAS": 1,
+      "MEM": 1,
+      "LRN": 1,
+      "EVL": 1,
+      "OPS": 1
+    },
+    "decision_weighting": "equal_within_bucket",
+    "rounding_digits": 1
+  },
+  "production_readiness": {
+    "strategy": "hard_gate_verdict",
+    "blocked_gate_status": "blocked",
+    "eligible_status": "eligible_for_review"
+  },
+  "change_control": {
+    "comparison_rule": "Scores are comparable only when contract_version and contract_sha256 both match.",
+    "methodology_change": "Create a new versioned contract and baseline; never edit this contract after its baseline is recorded."
+  }
+}

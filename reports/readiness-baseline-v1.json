@@ -1,0 +1,146 @@
+{
+  "schema_version": "readiness-baseline-v1",
+  "baseline_id": "taxonomy-v1-freeze-a46ca8c",
+  "recorded_at": "2026-07-13T11:22:57+05:30",
+  "source_git_commit": "a46ca8ca5d0c293fb701fedfe2575a78d8d491d8",
+  "score_contract": {
+    "version": "architecture-evidence-index-v1",
+    "sha256": "d26f5175f43a66aac99d80887c88de81ac6683d39127c53553a3d859df677bb4",
+    "taxonomy_version": "1.0"
+  },
+  "architecture_evidence_index": {
+    "name": "architecture_evidence_index_not_production_readiness",
+    "score": 40.5,
+    "score_unrounded": 40.52469135802469,
+    "scale": {
+      "D0 Design": 0,
+      "D1 Code": 20,
+      "D2 Tested": 40,
+      "D3 Shadow": 60,
+      "D4 Pilot": 80,
+      "D5 Graduated": 100
+    },
+    "bucket_weighting": "normalized versioned bucket weights",
+    "decision_weighting": "equal_within_bucket",
+    "rounding_digits": 1,
+    "score_contract": {
+      "version": "architecture-evidence-index-v1",
+      "sha256": "d26f5175f43a66aac99d80887c88de81ac6683d39127c53553a3d859df677bb4",
+      "taxonomy_version": "1.0"
+    },
+    "source": {
+      "path": "docs/adr-index.md",
+      "decision_count": 66,
+      "taxonomy_evidence_sha256": "19795180a15395fd1dac7e60fe9236b846985aebb3c4447ebf02b689c5784683"
+    },
+    "confidence": {
+      "representation": "per-bucket D-level evidence profile",
+      "limitation": "D-levels identify evidence stage; statistical confidence is reported separately for label precision"
+    },
+    "buckets": {
+      "FND": {
+        "score": 60.0,
+        "score_unrounded": 60.0,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.2,
+        "decision_count": 5,
+        "evidence_profile": {
+          "D2 Tested": 1,
+          "D3 Shadow": 3,
+          "D4 Pilot": 1
+        }
+      },
+      "SEM": {
+        "score": 43.3,
+        "score_unrounded": 43.333333333333336,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.16666666666666666,
+        "decision_count": 6,
+        "evidence_profile": {
+          "D0 Design": 1,
+          "D2 Tested": 2,
+          "D3 Shadow": 3
+        }
+      },
+      "SAF": {
+        "score": 42.9,
+        "score_unrounded": 42.857142857142854,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.14285714285714285,
+        "decision_count": 7,
+        "evidence_profile": {
+          "D2 Tested": 6,
+          "D3 Shadow": 1
+        }
+      },
+      "RTG": {
+        "score": 45.0,
+        "score_unrounded": 45.0,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.125,
+        "decision_count": 8,
+        "evidence_profile": {
+          "D0 Design": 1,
+          "D2 Tested": 3,
+          "D3 Shadow": 4
+        }
+      },
+      "CAS": {
+        "score": 45.7,
+        "score_unrounded": 45.714285714285715,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.14285714285714285,
+        "decision_count": 7,
+        "evidence_profile": {
+          "D2 Tested": 5,
+          "D3 Shadow": 2
+        }
+      },
+      "MEM": {
+        "score": 42.2,
+        "score_unrounded": 42.22222222222222,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.1111111111111111,
+        "decision_count": 9,
+        "evidence_profile": {
+          "D2 Tested": 8,
+          "D3 Shadow": 1
+        }
+      },
+      "LRN": {
+        "score": 11.4,
+        "score_unrounded": 11.428571428571429,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.14285714285714285,
+        "decision_count": 7,
+        "evidence_profile": {
+          "D0 Design": 5,
+          "D2 Tested": 2
+        }
+      },
+      "EVL": {
+        "score": 26.7,
+        "score_unrounded": 26.666666666666668,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.1111111111111111,
+        "decision_count": 9,
+        "evidence_profile": {
+          "D0 Design": 5,
+          "D3 Shadow": 4
+        }
+      },
+      "OPS": {
+        "score": 47.5,
+        "score_unrounded": 47.5,
+        "weight": 0.1111111111111111,
+        "decision_weight": 0.125,
+        "decision_count": 8,
+        "evidence_profile": {
+          "D1 Code": 1,
+          "D2 Tested": 5,
+          "D4 Pilot": 2
+        }
+      }
+    }
+  }
+}

@@ -24,6 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 
+from .features import extract
+from .learning_contract import (
+    COUNTERFACTUAL_EVIDENCE_SCHEMA_VERSION,
+    feature_payload_sha256,
+    load_learning_contract,
+    sanitize_predecision_features,
+)
 from .outcomes import FailureCause
 from .verifier import (
     CheckResult,
@@ -34,6 +41,8 @@ from .verifier import (
     run_command_checks,
     run_content_check,
     run_repository_content_check,
+    repository_identity_sha256,
+    verification_plan_sha256,
     verify_candidate,
 )
 
@@ -53,6 +62,7 @@ class CounterfactualTask:
     prompt: str
     repository: Path
     verification: VerificationPlan
+    verification_plan_version: str = "task-plan-v1"
     source: str = "synthetic"
     metadata: dict[str, Any] = field(default_factory=dict)
     require_clean_repository: bool = True
@@ -88,6 +98,17 @@ class VerificationSink(Protocol):
 
 @dataclass(frozen=True)
 class CounterfactualRecord:
+    evidence_schema_version: str
+    evidence_id: str
+    pair_id: str
+    learning_contract_version: str
+    feature_schema_version: str
+    features: dict[str, Any]
+    features_sha256: str
+    repository_sha256: str
+    verification_plan_version: str
+    verification_plan_sha256: str
+    decided_at: float
     run_id: str
     task_id: str
     task_source: str
@@ -437,6 +458,11 @@ def run_counterfactual(
     if (not isinstance(task.task_id, str) or not task.task_id.strip()
             or not isinstance(task.prompt, str) or not task.prompt.strip()):
         raise ValueError("counterfactual task id and prompt are required")
+    if (not isinstance(task.verification_plan_version, str)
+            or not task.verification_plan_version.strip()):
+        raise ValueError("counterfactual verification plan version is required")
+    if task.source not in {"organic", "synthetic"}:
+        raise ValueError("counterfactual task source must be organic or synthetic")
     if not isinstance(task.metadata, dict):
         raise ValueError("counterfactual task metadata must be a dictionary")
     if max_total_cost_usd is not None:
@@ -468,6 +494,14 @@ def run_counterfactual(
 
     repository = Path(task.repository).resolve()
     commit = _snapshot_commit(repository, task.require_clean_repository)
+    contract = load_learning_contract()
+    raw_features = asdict(extract(task.prompt, turn_index=0))
+    raw_features.pop("instruction_text", None)
+    features = sanitize_predecision_features(raw_features, contract)
+    features_hash = feature_payload_sha256(features, contract)
+    repository_hash = repository_identity_sha256(repository, commit)
+    plan_hash = verification_plan_sha256(task.verification)
+    decided_at = time.time()
     run_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:10]}"
     run_root = Path(output_root) / _safe_name(task.task_id) / run_id
     run_root.mkdir(parents=True, exist_ok=False)
@@ -532,6 +566,17 @@ def run_counterfactual(
                 except Exception:
                     verification_attached = False
             record = CounterfactualRecord(
+                evidence_schema_version=COUNTERFACTUAL_EVIDENCE_SCHEMA_VERSION,
+                evidence_id=f"counterfactual:{run_id}:{index}",
+                pair_id=run_id,
+                learning_contract_version=contract.contract_version,
+                feature_schema_version=contract.feature_schema_version,
+                features=dict(features),
+                features_sha256=features_hash,
+                repository_sha256=repository_hash,
+                verification_plan_version=task.verification_plan_version,
+                verification_plan_sha256=plan_hash,
+                decided_at=decided_at,
                 run_id=run_id,
                 task_id=task.task_id,
                 task_source=task.source,

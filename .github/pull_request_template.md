@@ -5,6 +5,7 @@
 - Decision effect: `implements | adds evidence | changes | supersedes | none`
 - Maturity transition: `D_ -> D_ | none`
 - Evidence produced:
+- Readiness contract/delta: `none | VERSION HASH: OLD -> NEW`
 - Architectural non-goals:
 
 Replace every placeholder and select exactly one decision effect. Use `none`

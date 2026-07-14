@@ -188,23 +188,23 @@ of the freeze date; it is not a promise about deployment outside this repository
 |---|---|---|---|---|
 | `ADRL-MEM-001` | Transaction memory is an append-oriented decision/outcome/event ledger keyed by immutable `route_id`. | Accepted | D2 Tested | [memory contract](../src/router/memory_ports.py), [SQLite provider](../src/router/memory_sqlite.py) |
 | `ADRL-MEM-002` | Outcome lifecycle is explicit: `pending`, `closed_turn`, then `closed_final` after late retry/interruption evidence. | Accepted | D2 Tested | [memory contract](../src/router/memory_ports.py), [memory tests](../tests/test_memory_sqlite.py) |
-| `ADRL-MEM-003` | Deterministic verification enriches an outcome without overwriting observed telemetry. | Accepted | D2 Tested | [verifier](../src/router/verifier.py), [memory contract](../src/router/memory_ports.py) |
+| `ADRL-MEM-003` | Deterministic verification enriches an outcome without overwriting observed telemetry. | Accepted | D2 Tested | [verifier](../src/router/verifier.py), [organic verification bridge](../src/router/live_verification.py), [tests](../tests/test_live_verification.py); representative organic labels remain open |
 | `ADRL-MEM-004` | Training labels keep task difficulty separate from dialect/capability, infrastructure, privacy, and policy failures. | Accepted | D2 Tested | [outcomes](../src/router/outcomes.py), [rule health](../src/router/rule_health.py) |
 | `ADRL-MEM-005` | Raw prompts are not stored by default; embeddings and instruction hashes are suppressed for private/secret turns. | Accepted | D2 Tested | [memory facade](../src/router/memory_facade.py), [privacy tests](../tests/test_privacy.py) |
 | `ADRL-MEM-006` | The router uses a fail-safe memory facade and provider port; SQLite is the current local provider, not a semantic dependency. | Accepted | D2 Tested | [memory facade](../src/router/memory_facade.py), [provider contract](../src/router/memory_ports.py) |
 | `ADRL-MEM-007` | Derived retrieval indexes are rebuildable projections and detect cross-process database changes. | Accepted | D2 Tested | [SQLite provider](../src/router/memory_sqlite.py) |
 | `ADRL-MEM-008` | Retrieval remains advisory/shadow until evaluated-label quantity and quality gates pass. | Accepted | D3 Shadow | [retrieval report](../reports/retrieval-shadow.md), [shadow router](../src/router/shadow_retrieval.py) |
-| `ADRL-MEM-009` | Counterfactual evidence attaches only to an explicit `route_id`; time or session proximity is never used to guess ownership. | Accepted | D2 Tested | [counterfactual runner](../src/router/counterfactual.py), [counterfactual tests](../tests/test_counterfactual.py) |
+| `ADRL-MEM-009` | Counterfactual evidence attaches only to an explicit `route_id`; time or session proximity is never used to guess ownership. | Accepted | D2 Tested | [counterfactual runner](../src/router/counterfactual.py), [organic verification bridge](../src/router/live_verification.py), [tests](../tests/test_live_verification.py) |
 
 ### LRN - Learning and Adaptation
 
 | ID | Decision | State | Maturity | Rationale / evidence |
 |---|---|---|---|---|
-| `ADRL-LRN-001` | Verified, cause-clean outcomes outrank heuristic proxy labels for training. | Accepted | D2 Tested | Plumbing: [verifier](../src/router/verifier.py), [outcomes](../src/router/outcomes.py); representative label volume remains open |
-| `ADRL-LRN-002` | Counterfactual training data uses paired local/frontier attempts from the same sanitized snapshot. | Accepted | D2 Tested | Plumbing: [counterfactual runner](../src/router/counterfactual.py); production pairs remain open |
+| `ADRL-LRN-001` | Verified, cause-clean outcomes outrank heuristic proxy labels for training. | Accepted | D2 Tested | Plumbing: [verifier](../src/router/verifier.py), [organic verification bridge](../src/router/live_verification.py), [outcomes](../src/router/outcomes.py); representative label volume remains open |
+| `ADRL-LRN-002` | Counterfactual training data uses paired local/frontier attempts from the same sanitized snapshot. | Accepted | D2 Tested | [Counterfactual runner](../src/router/counterfactual.py), [versioned evidence contract](../src/router/learning_contract.py), [tests](../tests/test_counterfactual.py), and [readiness evidence](../reports/learning-readiness.md); one valid organic same-snapshot pair is recorded, while representative volume and generalization remain open |
 | `ADRL-LRN-003` | Train a calibrated utility estimator for marginal frontier gain, not a classifier that imitates current heuristic routes. | Accepted | D0 Design | Cross-reference `ADRL-RTG-007` |
-| `ADRL-LRN-004` | Learned models may use only information available before the routing decision; outcome and future-session leakage are prohibited. | Accepted | D0 Design | Cross-reference `ADRL-EVL-002` |
-| `ADRL-LRN-005` | Every learned artifact versions its feature schema, data snapshot, objective, calibration, thresholds, and policy compatibility. | Accepted | D0 Design | Required before training implementation |
+| `ADRL-LRN-004` | Learned models may use only information available before the routing decision; outcome and future-session leakage are prohibited. | Accepted | D2 Tested | [learning contract](../config/learning-contract-v1.json), [contract enforcement](../src/router/learning_contract.py), [tests](../tests/test_learning_contract.py) |
+| `ADRL-LRN-005` | Every learned artifact versions its feature schema, data snapshot, objective, calibration, thresholds, and policy compatibility. | Accepted | D2 Tested | [artifact contract](../config/learning-contract-v1.json), [manifest validation](../src/router/learning_contract.py), [tests](../tests/test_learning_contract.py) |
 | `ADRL-LRN-006` | Uncertain or out-of-distribution predictions abstain to the deterministic safe policy. | Accepted | D0 Design | Cross-reference `ADRL-RTG-007` |
 | `ADRL-LRN-007` | Learning may propose policy updates, but deployment requires offline evaluation and explicit graduation; no autonomous online promotion. | Accepted | D0 Design | Cross-reference `ADRL-EVL-006` |
 
@@ -213,14 +213,14 @@ of the freeze date; it is not a promise about deployment outside this repository
 | ID | Decision | State | Maturity | Rationale / evidence |
 |---|---|---|---|---|
 | `ADRL-EVL-001` | Every routing policy is compared with best-single, always-local, always-frontier, current heuristic, and current classifier baselines. | Accepted | D3 Shadow | [Phase 0 exit](../reports/phase0-exit.md), [policy replay](../reports/policy-replay.md) |
-| `ADRL-EVL-002` | Evaluation uses temporal and repository/task holdouts to detect memorization and distribution leakage. | Accepted | D0 Design | Required by `ADRL-LRN-004` |
+| `ADRL-EVL-002` | Evaluation uses temporal and repository/task holdouts to detect memorization and distribution leakage. | Accepted | D2 Tested | [split contract](../config/learning-contract-v1.json), [split enforcement](../src/router/learning_contract.py), [tests](../tests/test_learning_contract.py) |
 | `ADRL-EVL-003` | Success means lower cost/latency at non-inferior verified quality, retry, privacy, and reliability rates. | Accepted | D3 Shadow | [Metrics](adaptive-routing-layer-design.md), [utility shadow](../reports/p1-utility-shadow.md) |
 | `ADRL-EVL-004` | Retrieval cannot graduate without at least 300 evaluated middle-band decisions and adequate hard-case support. | Accepted | D3 Shadow | [retrieval report](../reports/retrieval-shadow.md) |
 | `ADRL-EVL-005` | Simulator evidence cannot substitute for organic evidence until the realism gate passes. | Accepted | D3 Shadow | [realism scorecard](../reports/realism-scorecard.md), [realism plan](../reports/simulator-realism-plan.md) |
 | `ADRL-EVL-006` | Policy exposure advances through offline/replay, shadow, constrained canary, and graduated operation with rollback at every live stage. | Accepted | D0 Design | [Rollout plan](adaptive-routing-layer-design.md) |
 | `ADRL-EVL-007` | A learned router must beat both the heuristic policy and best-single baseline before receiving live authority. | Accepted | D0 Design | Required by `ADRL-RTG-007` |
 | `ADRL-EVL-008` | Production-readiness claims require representative constrained-model and real production-model evaluation, not simulator-only results. | Accepted | D0 Design | Execution is deferred; see [Phase 1 representativeness](phase1-plan.md) and [Phase 0 carryover](../reports/phase0-exit.md) |
-| `ADRL-EVL-009` | Readiness scores are evidence-derived per bucket; an aggregate score must expose weights, gates, and confidence rather than average away blockers. | Accepted | D0 Design | Governs future readiness audits |
+| `ADRL-EVL-009` | Readiness scores are evidence-derived per bucket; an aggregate score must expose weights, gates, and confidence rather than average away blockers. | Accepted | D2 Tested | [frozen scoring contract](../config/readiness-score-v1.json), [baseline and change control](readiness-scoring.md), [readiness implementation](../src/router/learning_readiness.py), [scorecard](../reports/learning-readiness.md), [tests](../tests/test_learning_readiness.py) |
 
 ### OPS - Platform, Runtime, and Operations
 
@@ -301,7 +301,8 @@ Rules for use:
 | `AGENTS.md` | Codex must classify substantive work before planning or editing and carry the primary ID through implementation and closeout. |
 | `.github/pull_request_template.md` | Every pull request records classification, decision effect, maturity effect, evidence, and non-goals. |
 | `tools/check_adr_taxonomy.py` | Validates frozen buckets, IDs, states, maturity vocabulary, evidence links, and completed PR classification. |
-| `.github/workflows/test.yml` | Fails the `pytest` status check when taxonomy or PR classification validation fails. Branch protection must require this check to block merges. |
+| `tools/check_readiness_score.py` | Reconstructs the frozen baseline, recomputes the current architecture index, and validates matching JSON, Markdown, and append-only history. |
+| `.github/workflows/test.yml` | Fails the status check when taxonomy, readiness artifacts, PR classification, or tests fail. Branch protection must require this check to block merges. |
 | `.codex/prompts/code-review.md` | Reviews taxonomy ownership, accepted-decision compliance, and evidence-backed maturity claims. |
 
 These layers serve different purposes. `AGENTS.md` guides agent reasoning;
