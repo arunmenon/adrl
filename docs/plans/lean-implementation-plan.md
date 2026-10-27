@@ -271,3 +271,11 @@ GitHub main reviewed at 20ca99d on 27 October 2026. Links below are pinned to th
 [Memory contract](https://github.com/arunmenon/adrl/blob/20ca99dab5cf04d1076dde0c6437f8bd77fa13cc/src/router/memory_ports.py)
 
 [Memory facade and enrichment integration](https://github.com/arunmenon/adrl/blob/20ca99dab5cf04d1076dde0c6437f8bd77fa13cc/src/router/memory_facade.py)
+
+## Companion artifacts (27 October 2026)
+
+The finalized source documents and architecture diagram below describe the same proposed plan. They are not implementation evidence. The follow-up request authorizes only adding these three documentation artifacts and links to this branch; application implementation, paid/live calls, a pull request and a merge remain outside scope.
+
+- [Proposed architecture diagram (PNG)](artifacts/adrl-planned-architecture.png)
+- [Implementation plan source (Word)](artifacts/ADRL-implementation-plan-2026-10-27.docx)
+- [Implementation plan companion (PDF)](artifacts/ADRL-implementation-plan-2026-10-27.pdf)
